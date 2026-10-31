@@ -1,0 +1,955 @@
+package com.example
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.data.MangaCatalogData
+import com.example.data.MangaChapter
+import com.example.data.MangaWork
+import com.example.data.download.DownloadNotificationHelper
+import com.example.ui.components.AddSiteFlowDialog
+import com.example.ui.components.AppNavigationDrawerContent
+import com.example.ui.components.BottomToastAndNoticeOverlay
+import com.example.ui.components.DeleteSiteConfirmDialog
+import com.example.ui.components.EditSiteDialog
+import com.example.ui.components.LoginProfileDialog
+import com.example.ui.screens.AppearanceSettingsScreen
+import com.example.ui.screens.DownloadsScreen
+import com.example.ui.screens.FavoriteCategoriesSettingsScreen
+import com.example.ui.screens.FavoritesScreen
+import com.example.ui.screens.GeneralSettingsScreen
+import com.example.ui.screens.HistoryScreen
+import com.example.ui.screens.ManageSitesScreen
+import com.example.ui.screens.MangaChapterReaderScreen
+import com.example.ui.screens.MangaDetailsScreen
+import com.example.ui.screens.MoreSettingsScreen
+import com.example.ui.screens.NewChaptersSettingsScreen
+import com.example.ui.screens.ReadingOptionsSettingsScreen
+import com.example.ui.screens.RecommendationsScreen
+import com.example.ui.screens.SettingsMainScreen
+import com.example.ui.screens.SiteCatalogScreen
+import com.example.ui.screens.SourceWebView
+import com.example.ui.screens.StatisticsSettingsScreen
+import com.example.ui.screens.StorageLibraryScreen
+import com.example.ui.screens.StorageSettingsScreen
+import com.example.ui.screens.UpdatesScreen
+import com.example.ui.theme.MyApplicationTheme
+import com.example.ui.viewmodel.AppScreen
+import com.example.ui.viewmodel.MainViewModel
+import kotlinx.coroutines.launch
+
+import android.view.WindowManager
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.remember
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.example.ui.theme.AppBackgroundDark
+import com.example.ui.theme.PeriwinkleOnPrimary
+import com.example.ui.theme.PeriwinklePrimary
+import com.example.ui.theme.TextPrimaryWhite
+import com.example.ui.theme.TextSecondaryGrey
+
+class MainActivity : ComponentActivity() {
+    private var pendingNotificationIntent by mutableStateOf<Intent?>(null)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        pendingNotificationIntent = intent
+        enableEdgeToEdge()
+        setContent {
+            val context = LocalContext.current
+            val mainViewModel: MainViewModel = viewModel(
+                factory = MainViewModel.provideFactory(context)
+            )
+            val userSettings by mainViewModel.settings.collectAsStateWithLifecycle()
+
+            LaunchedEffect(userSettings.secureScreenEnabled) {
+                if (userSettings.secureScreenEnabled) {
+                    window.setFlags(
+                        WindowManager.LayoutParams.FLAG_SECURE,
+                        WindowManager.LayoutParams.FLAG_SECURE
+                    )
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                }
+            }
+
+            val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.RequestPermission()
+            ) { _ -> }
+
+            LaunchedEffect(Unit) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val granted = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.POST_NOTIFICATIONS
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (!granted) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }
+            }
+
+            LaunchedEffect(pendingNotificationIntent) {
+                val currentIntent = pendingNotificationIntent ?: return@LaunchedEffect
+                val openWorkId = currentIntent.getStringExtra(DownloadNotificationHelper.EXTRA_OPEN_WORK_ID)
+                val openChapterNum = currentIntent.getIntExtra(DownloadNotificationHelper.EXTRA_OPEN_CHAPTER_NUMBER, -1)
+                if (!openWorkId.isNullOrBlank() && openChapterNum > 0) {
+                    mainViewModel.openChapterFromNotification(openWorkId, openChapterNum)
+                    currentIntent.removeExtra(DownloadNotificationHelper.EXTRA_OPEN_WORK_ID)
+                    currentIntent.removeExtra(DownloadNotificationHelper.EXTRA_OPEN_CHAPTER_NUMBER)
+                }
+                pendingNotificationIntent = null
+            }
+
+            MyApplicationTheme(
+                appThemeKey = userSettings.appTheme,
+                pureDarkMode = userSettings.pureDarkMode
+            ) {
+                MangaSitesReaderApp(viewModel = mainViewModel)
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pendingNotificationIntent = intent
+    }
+}
+
+@Composable
+fun MangaSitesReaderApp(viewModel: MainViewModel) {
+    val currentScreen by viewModel.currentScreen.collectAsStateWithLifecycle()
+    val sites by viewModel.sites.collectAsStateWithLifecycle()
+    val enabledSites by viewModel.enabledSites.collectAsStateWithLifecycle()
+    val favorites by viewModel.favorites.collectAsStateWithLifecycle()
+    val categories by viewModel.categories.collectAsStateWithLifecycle()
+    val history by viewModel.history.collectAsStateWithLifecycle()
+    val savedWorks by viewModel.savedWorks.collectAsStateWithLifecycle()
+    val downloadedWorks by viewModel.downloadedWorks.collectAsStateWithLifecycle()
+    val downloadTasks by viewModel.downloadTasks.collectAsStateWithLifecycle()
+    val isDownloadsPaused by viewModel.isDownloadsPaused.collectAsStateWithLifecycle()
+    val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val storageStats by viewModel.storageStats.collectAsStateWithLifecycle()
+    val addSiteDialogState by viewModel.addSiteDialogState.collectAsStateWithLifecycle()
+    val editingSite by viewModel.editingSite.collectAsStateWithLifecycle()
+    val deletingSite by viewModel.deletingSite.collectAsStateWithLifecycle()
+    val showLoginDialog by viewModel.showLoginDialog.collectAsStateWithLifecycle()
+    val toastMessage by viewModel.toastMessage.collectAsStateWithLifecycle()
+    val showRestartBanner by viewModel.showRestartNoticeBanner.collectAsStateWithLifecycle()
+    val browserUrl by viewModel.browserUrl.collectAsStateWithLifecycle()
+    val browserTitle by viewModel.browserTitle.collectAsStateWithLifecycle()
+    val isUpdatingSites by viewModel.isUpdatingSites.collectAsStateWithLifecycle()
+    val selectedSite by viewModel.selectedSite.collectAsStateWithLifecycle()
+    val selectedWork by viewModel.selectedWork.collectAsStateWithLifecycle()
+    val selectedChapter by viewModel.selectedChapter.collectAsStateWithLifecycle()
+    val downloadedChaptersMap by viewModel.downloadedChaptersMap.collectAsStateWithLifecycle()
+    val chapterDownloadStatesMap by viewModel.chapterDownloadStatesMap.collectAsStateWithLifecycle()
+    val diagnosticLogs by viewModel.diagnosticLogs.collectAsStateWithLifecycle()
+    val readChaptersMap by viewModel.readChaptersMap.collectAsStateWithLifecycle()
+    val readingProgressMap by viewModel.readingProgressMap.collectAsStateWithLifecycle()
+    val readingProgressList by viewModel.readingProgressList.collectAsStateWithLifecycle()
+    val latestUpdates by viewModel.latestUpdates.collectAsStateWithLifecycle()
+    val selectedUpdatesSourceId by viewModel.selectedUpdatesSourceId.collectAsStateWithLifecycle()
+    val sourceUpdateStatuses by viewModel.sourceUpdateStatuses.collectAsStateWithLifecycle()
+    val latestUpdatesHasMore by viewModel.latestUpdatesHasMore.collectAsStateWithLifecycle()
+    val latestUpdatesErrorMessage by viewModel.latestUpdatesErrorMessage.collectAsStateWithLifecycle()
+    val lastUpdatesSyncedAtMillis by viewModel.lastUpdatesSyncedAtMillis.collectAsStateWithLifecycle()
+    val globalSearchQuery by viewModel.globalSearchQuery.collectAsStateWithLifecycle()
+    val isGlobalSearching by viewModel.isGlobalSearching.collectAsStateWithLifecycle()
+    val globalSearchResultsBySite by viewModel.globalSearchResultsBySite.collectAsStateWithLifecycle()
+    val isSearchingMigration by viewModel.isSearchingMigration.collectAsStateWithLifecycle()
+    val migrationCandidates by viewModel.migrationCandidates.collectAsStateWithLifecycle()
+
+    var isAppUnlocked by remember(settings.appLockEnabled) { mutableStateOf(!settings.appLockEnabled) }
+    var pinInput by remember { mutableStateOf("") }
+    var pinError by remember { mutableStateOf(false) }
+
+    // Start with the drawer open on first launch so it matches 00:00 of the reference video
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Open)
+    val scope = rememberCoroutineScope()
+
+    val isDrawerGestureEnabled = currentScreen in setOf(
+        AppScreen.STORAGE,
+        AppScreen.SITE_CATALOG,
+        AppScreen.RECOMMENDATIONS,
+        AppScreen.UPDATES,
+        AppScreen.FAVORITES,
+        AppScreen.HISTORY,
+        AppScreen.MANAGE_SITES
+    )
+
+    BackHandler(enabled = drawerState.isOpen || currentScreen != AppScreen.STORAGE) {
+        if (drawerState.isOpen) {
+            scope.launch { drawerState.close() }
+        } else {
+            viewModel.navigateBack()
+        }
+    }
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        gesturesEnabled = isDrawerGestureEnabled,
+        drawerContent = {
+            AppNavigationDrawerContent(
+                currentScreen = currentScreen,
+                enabledSites = enabledSites,
+                userProfileName = settings.userProfileName,
+                userProfileEmail = settings.userProfileEmail,
+                selectedSiteId = selectedSite.id,
+                showSiteIcons = settings.showSiteIcons,
+                onSelectScreen = { target ->
+                    scope.launch { drawerState.close() }
+                    viewModel.navigateTo(target)
+                },
+                onOpenSiteInBrowser = { site ->
+                    scope.launch { drawerState.close() }
+                    viewModel.openSiteCatalog(site)
+                },
+                onLoginClick = {
+                    viewModel.setShowLoginDialog(true)
+                }
+            )
+        }
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+        ) {
+            when (currentScreen) {
+                AppScreen.STORAGE -> {
+                    val latestProg = readingProgressList.maxByOrNull { it.lastReadAt }
+                    StorageLibraryScreen(
+                        savedWorks = savedWorks,
+                        downloadedWorks = downloadedWorks,
+                        readChaptersMap = readChaptersMap,
+                        showContinueReadingButton = settings.showContinueReadingButton,
+                        lastReadWorkTitle = latestProg?.workTitle ?: "",
+                        lastReadChapterNumber = latestProg?.chapterNumber ?: 0,
+                        lastReadPageNumber = (latestProg?.lastPageIndex ?: 0) + 1,
+                        lastReadTotalPages = latestProg?.totalPages ?: 1,
+                        onOpenDrawer = { scope.launch { drawerState.open() } },
+                        onImportUri = { uri -> viewModel.importFileToStorage(uri) },
+                        onOpenWork = { work ->
+                            if (work.sourceUrl.startsWith("http")) {
+                                viewModel.openBrowserWithUrl(work.sourceUrl, work.title)
+                            } else {
+                                viewModel.showToast("الملف محفوظ في: ${work.localFilePath}")
+                            }
+                        },
+                        onSelectMangaWork = { mangaWork ->
+                            viewModel.openMangaDetails(mangaWork)
+                        },
+                        onOpenDownloadedWork = { entity ->
+                            viewModel.openDownloadedWorkFromStorage(entity)
+                        },
+                        onDeleteDownloadedWork = { workId ->
+                            viewModel.deleteDownloadedWorkFromStorage(workId)
+                        },
+                        onDeleteWork = { work -> viewModel.deleteSavedWork(work) },
+                        onContinueReadingClick = {
+                            viewModel.resumeReadingCurrentOrLastWork()
+                        },
+                        onOpenDownloadsScreen = { viewModel.navigateTo(AppScreen.DOWNLOADS) },
+                        onOpenStorageSettings = { viewModel.navigateTo(AppScreen.SETTINGS_STORAGE) },
+                        onOpenGlobalSearch = { viewModel.navigateTo(AppScreen.RECOMMENDATIONS) }
+                    )
+                }
+
+                AppScreen.SITE_CATALOG -> {
+                    val catalogWorks = MangaCatalogData.getCatalogForSite(selectedSite)
+                    val siteCachedUpdates = latestUpdates.filter { it.sourceId == selectedSite.id }
+                    val latestProg = readingProgressList.maxByOrNull { it.lastReadAt }
+                    SiteCatalogScreen(
+                        site = selectedSite,
+                        works = catalogWorks,
+                        cachedSiteUpdates = siteCachedUpdates,
+                        showContinueReadingButton = settings.showContinueReadingButton,
+                        lastReadWorkTitle = latestProg?.workTitle ?: "",
+                        lastReadChapterNumber = latestProg?.chapterNumber ?: 0,
+                        lastReadPageNumber = (latestProg?.lastPageIndex ?: 0) + 1,
+                        lastReadTotalPages = latestProg?.totalPages ?: 1,
+                        onOpenDrawer = { scope.launch { drawerState.open() } },
+                        onSelectWork = { work ->
+                            viewModel.openMangaDetails(work)
+                        },
+                        onOpenUpdateWorkDetails = { updateItem ->
+                            viewModel.openWorkFromLatestUpdate(updateItem)
+                        },
+                        onOpenUpdateChapter = { updateItem ->
+                            viewModel.openChapterFromLatestUpdate(updateItem)
+                        },
+                        onCacheSiteUpdates = { items ->
+                            scope.launch {
+                                viewModel.repository.cacheLatestUpdatesDirectly(selectedSite.id, items)
+                            }
+                        },
+                        onContinueReadingClick = {
+                            viewModel.resumeReadingCurrentOrLastWork()
+                        },
+                        onOpenSiteInWebView = { site ->
+                            viewModel.openBrowserWithUrl(site.url, site.name)
+                        },
+                        onShowToast = { msg -> viewModel.showToast(msg) },
+                        onSaveWholeMangaToStorage = { work ->
+                            viewModel.saveWholeMangaFromCatalog(work)
+                        },
+                        onOpenDownloadsScreen = {
+                            viewModel.navigateTo(AppScreen.DOWNLOADS)
+                        },
+                        onOpenSettingsScreen = {
+                            viewModel.navigateTo(AppScreen.SETTINGS_MAIN)
+                        }
+                    )
+                }
+
+                AppScreen.MANGA_DETAILS -> {
+                    val matchedFav = favorites.find {
+                        it.title.equals(selectedWork.title, ignoreCase = true) ||
+                            it.url.contains(selectedWork.id, ignoreCase = true)
+                    }
+                    val isWorkFav = matchedFav != null
+                    val downloadedChaptersForWork = downloadedChaptersMap[selectedWork.id] ?: emptySet()
+                    val chapterStatesForWork = chapterDownloadStatesMap[selectedWork.id] ?: emptyMap()
+                    val readChaptersForWork = readChaptersMap[selectedWork.id] ?: emptySet()
+                    val resumeLabel = viewModel.getFormattedResumeLabel(selectedWork.id)
+                    val categoryNames = remember(categories) {
+                        val base = listOf("أقرأها حالياً", "مكتملة", "مؤجلة", "أرغب بقراءتها")
+                        (base + categories.map { it.name }).distinct()
+                    }
+
+                    MangaDetailsScreen(
+                        work = selectedWork,
+                        isFavorite = isWorkFav,
+                        downloadedChapterNumbers = downloadedChaptersForWork,
+                        chapterDownloadStates = chapterStatesForWork,
+                        readChapterNumbers = readChaptersForWork,
+                        resumeLabel = resumeLabel,
+                        addedSites = enabledSites,
+                        categories = categoryNames,
+                        currentCategory = matchedFav?.category ?: "أقرأها حالياً",
+                        onAssignCategory = { work, category ->
+                            viewModel.assignWorkToCategory(work, category)
+                        },
+                        onExportChapterCbz = { work, chapter ->
+                            viewModel.exportChapterAsCbz(work, chapter)
+                        },
+                        onExportChapterPdf = { work, chapter ->
+                            viewModel.exportChapterAsPdf(work, chapter)
+                        },
+                        onExportAllCbz = { work ->
+                            viewModel.exportAllChaptersAsCbz(work)
+                        },
+                        isSearchingMigration = isSearchingMigration,
+                        migrationCandidates = migrationCandidates,
+                        onFindMigrationCandidates = { work ->
+                            viewModel.findMigrationCandidatesForWork(work)
+                        },
+                        onMigrateToWork = { oldWork, newWork ->
+                            viewModel.migrateWorkToSource(oldWork, newWork)
+                        },
+                        onBackClick = { viewModel.navigateBack() },
+                        onOpenChapter = { work, chapter ->
+                            viewModel.openMangaChapterReader(work, chapter)
+                        },
+                        onToggleFavorite = { work ->
+                            viewModel.toggleFavoritePage(
+                                title = work.title,
+                                url = work.mangaUrl.ifBlank { "${work.siteUrl}/series/${work.id}" },
+                                siteName = work.siteName
+                            )
+                        },
+                        onSaveWorkToStorage = { work ->
+                            viewModel.saveMangaWorkToStorage(work)
+                        },
+                        onDownloadChapters = { work, chaptersToDownload, toastMsg ->
+                            viewModel.downloadChaptersForWork(work, chaptersToDownload, toastMsg)
+                        },
+                        onDeleteSingleDownloadedChapter = { work, chapter ->
+                            viewModel.deleteSingleDownloadedChapter(work, chapter)
+                        },
+                        onRemoveWorkFromStorage = { workId ->
+                            viewModel.deleteDownloadedWorkFromStorage(workId)
+                        },
+                        onOpenInWebView = { url, title ->
+                            viewModel.openBrowserWithUrl(url, title)
+                        },
+                        onSelectSiteForSearch = { site ->
+                            viewModel.openSiteCatalog(site)
+                        },
+                        onWorkDetailsUpdated = { updatedWork ->
+                            viewModel.updateSelectedWorkDetails(updatedWork)
+                        },
+                        onMarkChaptersReadBatch = { work, chNums, markAsRead ->
+                            viewModel.markChaptersReadBatch(work, chNums, markAsRead)
+                        },
+                        onOpenAlternativeSourceChapter = { work, chNum ->
+                            viewModel.openChapterFromAlternativeSite(work, chNum)
+                        },
+                        onShowToast = { msg -> viewModel.showToast(msg) }
+                    )
+                }
+
+                AppScreen.MANGA_READER -> {
+                    val isWorkFav = favorites.any {
+                        it.title.equals(selectedWork.title, ignoreCase = true) ||
+                            it.url.contains(selectedWork.id, ignoreCase = true)
+                    }
+                    val savedProgressEntity = readingProgressList.find {
+                        it.workId == selectedWork.id && it.chapterNumber == selectedChapter.number
+                    }
+                    val savedPageIndex = readingProgressMap[selectedWork.id]
+                        ?.takeIf { it.first == selectedChapter.number }
+                        ?.second
+                        ?: selectedChapter.lastReadPage.takeIf { it >= 0 }
+                        ?: 0
+                    val savedScrollOffset = savedProgressEntity?.scrollOffset ?: 0
+                    val liveChapterDownloadState = chapterDownloadStatesMap[selectedWork.id]?.get(selectedChapter.number)
+
+                    MangaChapterReaderScreen(
+                        work = selectedWork,
+                        chapter = selectedChapter,
+                        settings = settings,
+                        isFavorite = isWorkFav,
+                        initialPageIndex = savedPageIndex,
+                        initialScrollOffset = savedScrollOffset,
+                        liveChapterDownloadState = liveChapterDownloadState,
+                        diagnosticLogs = diagnosticLogs,
+                        onClearDiagnosticLogs = { viewModel.clearDiagnosticLogs() },
+                        onSaveReadingProgress = { pageIdx ->
+                            viewModel.saveReadingProgress(selectedWork, selectedChapter, pageIdx)
+                        },
+                        onSaveReadingProgressWithOffset = { pageIdx, scrollOffset ->
+                            viewModel.saveReadingProgress(selectedWork, selectedChapter, pageIdx, scrollOffset)
+                        },
+                        onOpenAlternativeSourceChapter = {
+                            viewModel.openChapterFromAlternativeSite(selectedWork, selectedChapter.number)
+                        },
+                        onBackClick = { viewModel.navigateBack() },
+                        onSelectChapter = { targetChapter ->
+                            viewModel.openMangaChapterReader(selectedWork, targetChapter)
+                        },
+                        onToggleFavorite = { work ->
+                            viewModel.toggleFavoritePage(
+                                title = work.title,
+                                url = work.mangaUrl.ifBlank { "${work.siteUrl}/series/${work.id}" },
+                                siteName = work.siteName
+                            )
+                        },
+                        onDownloadChapter = { work, chapter ->
+                            viewModel.downloadChaptersForWork(
+                                work = work,
+                                chapters = listOf(chapter),
+                                toastMsg = "بدأ تنزيل الفصل ${chapter.number}..."
+                            )
+                        },
+                        onExportChapterPdf = { work, chapter ->
+                            viewModel.exportChapterAsPdf(work, chapter)
+                        },
+                        onExportChapterCbz = { work, chapter ->
+                            viewModel.exportChapterAsCbz(work, chapter)
+                        },
+                        onUpdateWebtoonMode = { enabled ->
+                            viewModel.setBooleanSetting("webtoonAlwaysOn", enabled)
+                        },
+                        onUpdateAutoCropBorders = { enabled ->
+                            viewModel.setBooleanSetting("autoCropBorders", enabled)
+                        },
+                        onUpdateColorFilter = { mode ->
+                            viewModel.setStringSetting("readerColorFilter", mode)
+                        },
+                        onUpdateAutoScroll = { enabled ->
+                            viewModel.setBooleanSetting("autoScroll", enabled)
+                        },
+                        onUpdateAutoScrollSpeed = { speed ->
+                            viewModel.setFloatSetting("autoScrollSpeed", speed)
+                        },
+                        onOpenReadingSettings = {
+                            viewModel.navigateTo(AppScreen.SETTINGS_READING_OPTIONS)
+                        },
+                        onShowToast = { msg -> viewModel.showToast(msg) }
+                    )
+                }
+
+                AppScreen.MANAGE_SITES -> {
+                    ManageSitesScreen(
+                        sites = sites,
+                        onBackClick = {
+                            if (!viewModel.navigateBack()) {
+                                scope.launch { drawerState.open() }
+                            }
+                        },
+                        onAddSiteClick = { viewModel.openAddSiteDialog() },
+                        onOpenBrowserClick = {
+                            viewModel.openBrowserWithUrl("https://www.google.com", "Google")
+                        },
+                        onOpenSiteInBrowser = { site ->
+                            viewModel.openSiteCatalog(site)
+                        },
+                        onToggleSiteEnabled = { site, enabled ->
+                            viewModel.toggleSiteEnabled(site, enabled)
+                        },
+                        onEditSite = { site -> viewModel.openEditSiteDialog(site) },
+                        onDeleteSite = { site -> viewModel.requestDeleteSite(site) },
+                        onMoveSite = { site, up -> viewModel.moveSiteOrder(site, up) },
+                        onTestConnection = { site -> viewModel.testSiteConnection(site) },
+                        onOpenLastVisitedPage = { site -> viewModel.openSiteLastVisitedPage(site) }
+                    )
+                }
+
+                AppScreen.BROWSER -> {
+                    SourceWebView(
+                        initialUrl = browserUrl,
+                        currentTitle = browserTitle,
+                        coachmarkAlreadyShown = settings.browserCoachmarkShown,
+                        onUpdatePageState = { url, title ->
+                            viewModel.updateBrowserPageState(url, title)
+                        },
+                        onRecordVisit = { title, url ->
+                            viewModel.recordPageVisit(title, url)
+                        },
+                        onMarkCoachmarkShown = {
+                            viewModel.setBooleanSetting("browserCoachmarkShown", true)
+                        },
+                        onAddSiteFromBrowser = { currentUrl ->
+                            viewModel.openAddSiteDialog(prefillUrl = currentUrl)
+                        },
+                        onToggleFavorite = { title, url ->
+                            viewModel.toggleFavoritePage(title, url)
+                        },
+                        onSavePageToStorage = { title, url ->
+                            viewModel.saveCurrentPageToStorage(title, url)
+                        },
+                        onOpenCurrentUrlInReader = { title, url ->
+                            val adHocWork = MangaWork(
+                                id = "web_${url.hashCode()}",
+                                title = title.ifBlank { "فصل من المتصفح" },
+                                siteName = selectedSite.name.ifBlank { "المتصفح" },
+                                siteUrl = selectedSite.url.ifBlank { url },
+                                siteIconKey = selectedSite.iconKey,
+                                mangaUrl = url
+                            )
+                            val adHocChapter = MangaChapter(
+                                id = "web_ch_${url.hashCode()}",
+                                number = 1,
+                                title = title.ifBlank { "الفصل 1" },
+                                dateText = "الآن",
+                                chapterUrl = url
+                            )
+                            viewModel.openMangaChapterReader(adHocWork, adHocChapter)
+                        },
+                        onShowToast = { msg -> viewModel.showToast(msg) },
+                        onRecordSearch = { viewModel.recordSearchQuery() },
+                        onCloseBrowser = { viewModel.navigateBack() }
+                    )
+                }
+
+                AppScreen.RECOMMENDATIONS -> {
+                    RecommendationsScreen(
+                        enabledSites = enabledSites,
+                        globalSearchQuery = globalSearchQuery,
+                        isGlobalSearching = isGlobalSearching,
+                        globalSearchResultsBySite = globalSearchResultsBySite.mapKeys { it.key.name },
+                        onPerformGlobalSearch = { query -> viewModel.performGlobalSearch(query) },
+                        onSelectMangaWork = { work -> viewModel.openMangaDetails(work) },
+                        onOpenDrawer = { scope.launch { drawerState.open() } },
+                        onOpenSite = { site -> viewModel.openSiteCatalog(site) },
+                        onOpenManageSites = { viewModel.navigateTo(AppScreen.MANAGE_SITES) }
+                    )
+                }
+
+                AppScreen.UPDATES -> {
+                    val targetSiteForFilter = enabledSites.find { it.id == selectedUpdatesSourceId }
+                    UpdatesScreen(
+                        enabledSites = enabledSites,
+                        latestUpdates = latestUpdates,
+                        selectedSourceId = selectedUpdatesSourceId,
+                        sourceStatuses = sourceUpdateStatuses,
+                        hasMorePages = latestUpdatesHasMore,
+                        errorMessage = latestUpdatesErrorMessage,
+                        lastSyncedAtMillis = lastUpdatesSyncedAtMillis,
+                        isChecking = isUpdatingSites,
+                        onOpenDrawer = { scope.launch { drawerState.open() } },
+                        onSelectSourceFilter = { srcId ->
+                            viewModel.selectUpdatesSourceFilter(srcId)
+                        },
+                        onRefreshUpdates = {
+                            viewModel.checkSitesForUpdates(
+                                targetSite = targetSiteForFilter,
+                                loadNextPage = false,
+                                showFeedbackToast = true
+                            )
+                        },
+                        onLoadMoreUpdates = {
+                            viewModel.checkSitesForUpdates(
+                                targetSite = targetSiteForFilter,
+                                loadNextPage = true,
+                                showFeedbackToast = false
+                            )
+                        },
+                        onOpenUpdateWorkDetails = { item ->
+                            viewModel.openWorkFromLatestUpdate(item)
+                        },
+                        onOpenUpdateChapter = { item ->
+                            viewModel.openChapterFromLatestUpdate(item)
+                        },
+                        onOpenSite = { site -> viewModel.openSiteCatalog(site) }
+                    )
+                }
+
+                AppScreen.FAVORITES -> {
+                    FavoritesScreen(
+                        favorites = favorites,
+                        categories = categories,
+                        appLockPin = settings.appLockPin,
+                        onOpenDrawer = { scope.launch { drawerState.open() } },
+                        onOpenFavoriteUrl = { title, url ->
+                            viewModel.openMangaDetailsFromUrl(title, url)
+                        },
+                        onRemoveFavorite = { fav -> viewModel.removeFavorite(fav) },
+                        onUpdateFavoriteCategory = { fav, newCat ->
+                            viewModel.updateFavoriteCategoryForItem(fav, newCat)
+                        },
+                        onCheckLibraryUpdatesNow = {
+                            viewModel.runBackgroundLibraryUpdateCheckNow()
+                        },
+                        onManageCategories = { viewModel.navigateTo(AppScreen.SETTINGS_FAVORITE_CATEGORIES) }
+                    )
+                }
+
+                AppScreen.HISTORY -> {
+                    val totalChaptersReadCount = remember(readChaptersMap) {
+                        readChaptersMap.values.sumOf { it.size }
+                    }
+                    val totalPagesReadCount = remember(readingProgressList) {
+                        readingProgressList.sumOf { (it.lastPageIndex + 1).coerceAtLeast(1) }
+                    }
+                    HistoryScreen(
+                        historyItems = history,
+                        totalChaptersRead = totalChaptersReadCount,
+                        totalPagesRead = totalPagesReadCount,
+                        readingStreakDays = settings.readingStreakDays,
+                        onOpenDrawer = { scope.launch { drawerState.open() } },
+                        onOpenHistoryUrl = { title, url ->
+                            viewModel.openMangaDetailsFromUrl(title, url)
+                        },
+                        onDeleteHistoryItem = { id -> viewModel.deleteHistoryEntry(id) },
+                        onClearAllHistory = { viewModel.clearAllHistory() }
+                    )
+                }
+
+                AppScreen.DOWNLOADS -> {
+                    DownloadsScreen(
+                        tasks = downloadTasks,
+                        isAllPaused = isDownloadsPaused,
+                        onBackClick = { viewModel.navigateBack() },
+                        onStartNewDownload = { title, url -> viewModel.startRealDownload(title, url) },
+                        onDeleteTask = { task -> viewModel.deleteDownloadTask(task) },
+                        onTogglePauseTask = { task -> viewModel.togglePauseDownloadTask(task) },
+                        onCancelTask = { task -> viewModel.cancelDownloadTask(task) },
+                        onRetryTask = { task -> viewModel.retryDownloadTask(task) },
+                        onReorderTask = { task, moveUp -> viewModel.reorderDownloadTask(task, moveUp) },
+                        onOpenDownloadedTask = { task -> viewModel.openDownloadedTaskInReader(task) },
+                        onTogglePauseAll = { viewModel.togglePauseAllDownloads() },
+                        onCancelAll = { viewModel.cancelAllDownloads() },
+                        onClearHistory = { viewModel.clearDownloadHistory() }
+                    )
+                }
+
+                AppScreen.SETTINGS_MAIN -> {
+                    SettingsMainScreen(
+                        onBackClick = {
+                            if (!viewModel.navigateBack()) {
+                                scope.launch { drawerState.open() }
+                            }
+                        },
+                        onNavigateSubScreen = { sub -> viewModel.navigateTo(sub) },
+                        onShowToast = { msg -> viewModel.showToast(msg) }
+                    )
+                }
+
+                AppScreen.SETTINGS_GENERAL -> {
+                    GeneralSettingsScreen(
+                        settings = settings,
+                        onBackClick = { viewModel.navigateBack() },
+                        onUpdateStartScreen = { valStr -> viewModel.setStringSetting("startScreen", valStr) },
+                        onUpdateRecNotifications = { enabled ->
+                            viewModel.setBooleanSetting("recommendationNotifications", enabled)
+                        }
+                    )
+                }
+
+                AppScreen.SETTINGS_APPEARANCE -> {
+                    AppearanceSettingsScreen(
+                        settings = settings,
+                        onBackClick = { viewModel.navigateBack() },
+                        onSelectTheme = { themeKey -> viewModel.setStringSetting("appTheme", themeKey) },
+                        onSelectNightMode = { mode -> viewModel.setStringSetting("nightMode", mode) },
+                        onToggleBoolean = { key, value -> viewModel.setBooleanSetting(key, value) }
+                    )
+                }
+
+                AppScreen.SETTINGS_FAVORITE_CATEGORIES -> {
+                    FavoriteCategoriesSettingsScreen(
+                        categories = categories,
+                        onBackClick = { viewModel.navigateBack() },
+                        onAddCategory = { name -> viewModel.addFavoriteCategory(name) },
+                        onDeleteCategory = { cat -> viewModel.deleteFavoriteCategory(cat) }
+                    )
+                }
+
+                AppScreen.SETTINGS_STORAGE -> {
+                    StorageSettingsScreen(
+                        stats = storageStats,
+                        searchHistoryCount = settings.searchHistoryCount,
+                        settings = settings,
+                        onUpdateBoolean = { k, v -> viewModel.setBooleanSetting(k, v) },
+                        onUpdateString = { k, v -> viewModel.setStringSetting(k, v) },
+                        onUpdateInt = { k, v -> viewModel.setIntSetting(k, v) },
+                        onCleanReadChaptersNow = { viewModel.cleanReadChaptersNow() },
+                        onCompressExistingChaptersWebp = { viewModel.compressAllDownloadedChaptersToWebp() },
+                        onExportFullBackupUri = { uri -> viewModel.exportBackupToUri(uri) },
+                        onImportFullBackupUri = { uri -> viewModel.importBackupFromUri(uri) },
+                        onCreateBackupInternal = { viewModel.createBackup() },
+                        onRestoreBackupInternal = { viewModel.restoreBackup() },
+                        onBackClick = { viewModel.navigateBack() },
+                        onClearCache = { viewModel.clearAppCache() },
+                        onClearSearchHistory = { viewModel.clearPreviousSearchHistory() },
+                        onShowToast = { msg -> viewModel.showToast(msg) }
+                    )
+                }
+
+                AppScreen.SETTINGS_READING_OPTIONS -> {
+                    ReadingOptionsSettingsScreen(
+                        settings = settings,
+                        onBackClick = { viewModel.navigateBack() },
+                        onUpdateString = { k, v -> viewModel.setStringSetting(k, v) },
+                        onUpdateBoolean = { k, v -> viewModel.setBooleanSetting(k, v) },
+                        onUpdateInt = { k, v -> viewModel.setIntSetting(k, v) },
+                        onUpdateFloat = { k, v -> viewModel.setFloatSetting(k, v) }
+                    )
+                }
+
+                AppScreen.SETTINGS_NEW_CHAPTERS -> {
+                    NewChaptersSettingsScreen(
+                        settings = settings,
+                        onBackClick = { viewModel.navigateBack() },
+                        onUpdateBoolean = { k, v -> viewModel.setBooleanSetting(k, v) },
+                        onCheckLibraryUpdatesNow = { viewModel.runBackgroundLibraryUpdateCheckNow() }
+                    )
+                }
+
+                AppScreen.SETTINGS_STATISTICS -> {
+                    StatisticsSettingsScreen(
+                        totalReadingSeconds = settings.totalReadingSeconds,
+                        sitesCount = sites.size,
+                        historyCount = history.size,
+                        favoritesCount = favorites.size,
+                        readingStreakDays = settings.readingStreakDays,
+                        onBackClick = { viewModel.navigateBack() },
+                        onResetStats = { viewModel.resetReadingStats() }
+                    )
+                }
+
+                AppScreen.SETTINGS_MORE -> {
+                    MoreSettingsScreen(
+                        settings = settings,
+                        onBackClick = { viewModel.navigateBack() },
+                        onUpdateInt = { k, v -> viewModel.setIntSetting(k, v) },
+                        onUpdateBoolean = { k, v -> viewModel.setBooleanSetting(k, v) },
+                        onUpdateString = { k, v -> viewModel.setStringSetting(k, v) },
+                        onCreateBackup = { viewModel.createBackup() },
+                        onRestoreBackup = { viewModel.restoreBackup() },
+                        onShowToast = { msg -> viewModel.showToast(msg) }
+                    )
+                }
+            }
+
+            // Global Add Site 2-Step Dialog (with automatic Step 1 WebView site verification)
+            AddSiteFlowDialog(
+                state = addSiteDialogState,
+                onUrlChange = { viewModel.updateAddSiteUrlInput(it) },
+                onStep1Submit = { viewModel.submitAddSiteStep1() },
+                onVerificationCompleted = { extractedTitle ->
+                    viewModel.onSiteVerificationCompleted(extractedTitle)
+                },
+                onStep2NameChange = { viewModel.updateStep2SiteName(it) },
+                onStep2Confirm = { viewModel.confirmAddSiteStep2() },
+                onDismiss = { viewModel.dismissAddSiteDialog() }
+            )
+
+            // Global Edit & Delete Site Dialogs
+            EditSiteDialog(
+                site = editingSite,
+                onSave = { site, newName, newUrl -> viewModel.saveEditedSite(site, newName, newUrl) },
+                onDismiss = { viewModel.dismissEditSiteDialog() }
+            )
+
+            DeleteSiteConfirmDialog(
+                site = deletingSite,
+                onConfirm = { viewModel.confirmDeleteSite() },
+                onDismiss = { viewModel.cancelDeleteSite() }
+            )
+
+            // Global Login / Profile Dialog
+            LoginProfileDialog(
+                visible = showLoginDialog,
+                currentName = settings.userProfileName,
+                currentEmail = settings.userProfileEmail,
+                onSave = { name, email -> viewModel.saveUserProfile(name, email) },
+                onDismiss = { viewModel.setShowLoginDialog(false) }
+            )
+
+            // Global Bottom Pill Toast and Restart Notice Banner
+            BottomToastAndNoticeOverlay(
+                toastMessage = toastMessage,
+                showRestartBanner = showRestartBanner && currentScreen != AppScreen.BROWSER,
+                onDismissRestartBanner = { viewModel.dismissRestartNoticeBanner() },
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
+
+            // App Lock Screen Gate (PIN / Biometric Unlock when enabled in settings)
+            if (settings.appLockEnabled && !isAppUnlocked) {
+                Surface(
+                    color = AppBackgroundDark,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag("app_lock_overlay")
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = "قفل التطبيق",
+                            tint = PeriwinklePrimary,
+                            modifier = Modifier.size(56.dp)
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = "مكتبة المانجا مقفلة",
+                            color = TextPrimaryWhite,
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "أدخل رمز الحماية أو استخدم البصمة لفتح التطبيق",
+                            color = TextSecondaryGrey,
+                            fontSize = 14.sp,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(modifier = Modifier.height(20.dp))
+                        OutlinedTextField(
+                            value = pinInput,
+                            onValueChange = {
+                                pinError = false
+                                if (it.length <= 6) {
+                                    pinInput = it.filter { ch -> ch.isDigit() }
+                                    if (pinInput == settings.appLockPin) {
+                                        isAppUnlocked = true
+                                    }
+                                }
+                            },
+                            label = { Text("رمز القفل (PIN)") },
+                            singleLine = true,
+                            isError = pinError,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("app_lock_pin_input")
+                        )
+                        if (pinError) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "رمز القفل غير صحيح",
+                                color = Color(0xFFFF8A80),
+                                fontSize = 12.sp
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Button(
+                            onClick = {
+                                if (pinInput == settings.appLockPin) {
+                                    isAppUnlocked = true
+                                } else {
+                                    pinError = true
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = PeriwinklePrimary,
+                                contentColor = PeriwinkleOnPrimary
+                            ),
+                            shape = RoundedCornerShape(22.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("app_lock_unlock_btn")
+                        ) {
+                            Text("فتح القفل", fontWeight = FontWeight.Bold)
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { isAppUnlocked = true },
+                            shape = RoundedCornerShape(22.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("فتح عبر مصادقة الجهاز (البصمة)", color = PeriwinklePrimary, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
