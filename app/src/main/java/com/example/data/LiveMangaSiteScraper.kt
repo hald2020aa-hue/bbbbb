@@ -85,7 +85,87 @@ object LiveMangaSiteScraper {
     private val workDetailsCache = ConcurrentHashMap<String, MangaWork>()
 
     fun initContext(context: Context) {
-        appContext = context.applicationContext
+        val appCtx = context.applicationContext
+        appContext = appCtx
+        try {
+            val defaultUa = WebSettings.getDefaultUserAgent(appCtx)
+            if (!defaultUa.isNullOrBlank()) {
+                activeUserAgent = sanitizeWebViewUserAgent(defaultUa)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * Removes Android WebView markers ("; wv" and "Version/X.X") from the device's genuine WebView User-Agent
+     * while preserving the exact Chromium version and device model so Sec-CH-UA / navigator.userAgentData
+     * inside Cloudflare Turnstile iframes match the HTTP User-Agent header 100%.
+     */
+    fun sanitizeWebViewUserAgent(rawUa: String): String {
+        if (rawUa.isBlank()) return DEFAULT_USER_AGENT
+        return rawUa
+            .replace(Regex("""\s*;\s*wv\b""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\bVersion/\d+(?:\.\d+)*\s*""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s{2,}"""), " ")
+            .trim()
+            .ifBlank { DEFAULT_USER_AGENT }
+    }
+
+    fun hasCloudflareClearanceCookie(url: String): Boolean {
+        if (url.isBlank()) return false
+        val cookies = getCombinedCookies(targetUrl = url)
+        return cookies.contains("cf_clearance=", ignoreCase = true)
+    }
+
+    /**
+     * Clears transient Cloudflare challenge state/retry cookies (__cf_bm, cf_chl_*) before starting a fresh
+     * interactive verification so failed headless or prior attempts do not cause an infinite Turnstile loop.
+     */
+    fun clearStaleCloudflareChallengeCookies(url: String) {
+        if (url.isBlank()) return
+        try {
+            val cm = CookieManager.getInstance() ?: return
+            val uri = URI(url.trim())
+            val host = uri.host ?: return
+            val scheme = uri.scheme ?: "https"
+            val rootDomain = host.removePrefix("www.")
+            val staleCookieNames = listOf(
+                "__cf_bm",
+                "cf_chl_2",
+                "cf_chl_prog",
+                "cf_chl_rc_ni",
+                "cf_chl_rc_m",
+                "cf_chl_seq_ni"
+            )
+            val origins = listOf(
+                "$scheme://$host",
+                "$scheme://$rootDomain",
+                "https://$host",
+                "https://$rootDomain"
+            ).distinct()
+            for (origin in origins) {
+                for (name in staleCookieNames) {
+                    cm.setCookie(origin, "$name=; Max-Age=0; Path=/")
+                    cm.setCookie(origin, "$name=; Max-Age=0; Domain=.$rootDomain; Path=/")
+                    cm.setCookie(origin, "$name=; Max-Age=0; Domain=$rootDomain; Path=/")
+                }
+            }
+            cm.flush()
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun isCloudflareChallengeTitle(title: String?): Boolean {
+        val t = title?.trim().orEmpty()
+        if (t.isBlank()) return false
+        return t.contains("Just a moment", ignoreCase = true) ||
+            t.contains("انتظر لحظة", ignoreCase = true) ||
+            t.contains("لحظة واحدة", ignoreCase = true) ||
+            t.contains("Attention Required", ignoreCase = true) ||
+            t.contains("DDOS-GUARD", ignoreCase = true) ||
+            t.contains("إجراء التحقق من الأمان", ignoreCase = true) ||
+            t.contains("Security Check", ignoreCase = true) ||
+            t.contains("Checking your browser", ignoreCase = true)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -108,11 +188,14 @@ object LiveMangaSiteScraper {
             blockNetworkImage = !loadImages
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             cacheMode = WebSettings.LOAD_DEFAULT
-            val nativeUa = userAgentString
-            if (!nativeUa.isNullOrBlank()) {
-                // Keep WebView's genuine User-Agent so it matches navigator.userAgentData / Sec-CH-UA inside Turnstile iframes
-                activeUserAgent = nativeUa
+            val rawUa = userAgentString
+            val cleanUa = if (!rawUa.isNullOrBlank()) {
+                sanitizeWebViewUserAgent(rawUa)
+            } else {
+                activeUserAgent
             }
+            userAgentString = cleanUa
+            activeUserAgent = cleanUa
         }
     }
 
@@ -213,32 +296,44 @@ object LiveMangaSiteScraper {
                                     try {
                                         CookieManager.getInstance().flush()
                                     } catch (_: Throwable) {}
-                                    // Trigger scroll events so lazy-load scripts populate data-src / src attributes immediately
-                                    try {
-                                        targetView.evaluateJavascript(
-                                            "(function(){ try { window.scrollTo(0, 1200); window.scrollTo(0, document.body.scrollHeight); window.scrollTo(0, 0); } catch(e){} })();",
-                                            null
-                                        )
-                                    } catch (_: Throwable) {}
-                                    fun pollDom() {
-                                        if (completed) return
-                                        pollCount++
-                                        targetView.evaluateJavascript(jsScript) { rawJson ->
-                                            if (completed) return@evaluateJavascript
-                                            val unwrapped = unwrapEvaluateJsString(rawJson ?: "")
-                                            val hasData = unwrapped.contains("\"pages\":[http") ||
-                                                unwrapped.contains("\"pages\":[\"http") ||
-                                                unwrapped.contains("\"items\":[{") ||
-                                                unwrapped.contains("\"chapters\":[{") ||
-                                                unwrapped.contains("\"updates\":[{")
-                                            if (hasData || pollCount >= 4) {
-                                                finishWith(rawJson)
-                                            } else {
-                                                targetView.postDelayed({ pollDom() }, 450L)
+
+                                    // First passively check if this page is an active Cloudflare challenge before any scroll/mutation
+                                    targetView.evaluateJavascript(JS_PASSIVE_CHECK_CF_STATUS) { cfRaw ->
+                                        if (completed) return@evaluateJavascript
+                                        val cfUnwrapped = unwrapEvaluateJsString(cfRaw ?: "")
+                                        if (cfUnwrapped.contains("\"cf\":true")) {
+                                            // Do NOT inject synthetic scroll or poll on an active Cloudflare challenge in a 0x0 WebView
+                                            finishWith(cfRaw)
+                                            return@evaluateJavascript
+                                        }
+                                        // Safe to trigger scroll events on real manga page so lazy-load scripts populate data-src / src attributes
+                                        try {
+                                            targetView.evaluateJavascript(
+                                                "(function(){ try { window.scrollTo(0, 1200); window.scrollTo(0, document.body.scrollHeight); window.scrollTo(0, 0); } catch(e){} })();",
+                                                null
+                                            )
+                                        } catch (_: Throwable) {}
+                                        fun pollDom() {
+                                            if (completed) return
+                                            pollCount++
+                                            targetView.evaluateJavascript(jsScript) { rawJson ->
+                                                if (completed) return@evaluateJavascript
+                                                val unwrapped = unwrapEvaluateJsString(rawJson ?: "")
+                                                val hasData = unwrapped.contains("\"pages\":[http") ||
+                                                    unwrapped.contains("\"pages\":[\"http") ||
+                                                    unwrapped.contains("\"galleryPages\":[\"") ||
+                                                    unwrapped.contains("\"items\":[{") ||
+                                                    unwrapped.contains("\"chapters\":[{") ||
+                                                    unwrapped.contains("\"updates\":[{")
+                                                if (hasData || pollCount >= 4) {
+                                                    finishWith(rawJson)
+                                                } else {
+                                                    targetView.postDelayed({ pollDom() }, 450L)
+                                                }
                                             }
                                         }
+                                        targetView.postDelayed({ pollDom() }, 300L)
                                     }
-                                    targetView.postDelayed({ pollDom() }, 300L)
                                 }
                             }
                         }
@@ -414,6 +509,11 @@ object LiveMangaSiteScraper {
                 html.contains("cf-browser-verification", ignoreCase = true) ||
                 html.contains("Just a moment", ignoreCase = true) ||
                 html.contains("انتظر لحظة", ignoreCase = true) ||
+                html.contains("لحظة واحدة", ignoreCase = true) ||
+                html.contains("إجراء التحقق من الأمان", ignoreCase = true) ||
+                html.contains("يستخدم هذا الموقع خدمة أمنية للحماية", ignoreCase = true) ||
+                html.contains("يتحقق موقع الويب من أنك لست روبوت", ignoreCase = true) ||
+                html.contains("الأداء والأمان من Cloudflare", ignoreCase = true) ||
                 html.contains("challenge-platform", ignoreCase = true) ||
                 html.contains("cf-turnstile", ignoreCase = true) ||
                 html.contains("ddos-guard", ignoreCase = true) ||
@@ -429,14 +529,20 @@ object LiveMangaSiteScraper {
         }
         return html.contains("<title>Just a moment", ignoreCase = true) ||
             html.contains("<title>انتظر لحظة", ignoreCase = true) ||
+            html.contains("<title>لحظة واحدة", ignoreCase = true) ||
             html.contains("<title>Attention Required", ignoreCase = true) ||
             html.contains("<title>DDOS-GUARD", ignoreCase = true) ||
             html.contains("cf-challenge-running", ignoreCase = true) ||
             html.contains("id=\"challenge-running\"", ignoreCase = true) ||
             html.contains("id=\"challenge-stage\"", ignoreCase = true) ||
+            html.contains("id=\"challenge-error-title\"", ignoreCase = true) ||
             html.contains("/cdn-cgi/challenge-platform/", ignoreCase = true) ||
+            html.contains("challenges.cloudflare.com/turnstile", ignoreCase = true) ||
             html.contains("Enable JavaScript and cookies to continue", ignoreCase = true) ||
             html.contains("Verify you are human by completing the action", ignoreCase = true) ||
+            html.contains("إجراء التحقق من الأمان", ignoreCase = true) ||
+            html.contains("يستخدم هذا الموقع خدمة أمنية للحماية من برامج الروبوتات الضارة", ignoreCase = true) ||
+            html.contains("يتحقق موقع الويب من أنك لست روبوت", ignoreCase = true) ||
             html.contains("يتم الآن التحقق من أنك إنسان", ignoreCase = true) ||
             html.contains("مراجعة أمان اتصالك", ignoreCase = true) ||
             html.contains("يرجى التحقق من أنك إنسان", ignoreCase = true)
@@ -673,8 +779,8 @@ object LiveMangaSiteScraper {
                 }
             }
 
-            // Headless WebView fallback if OkHttp got 0 works or hit Cloudflare on page 1
-            if (works.isEmpty() && page == 1) {
+            // Headless WebView fallback if OkHttp got 0 works (only run on Cloudflare if cf_clearance already exists so 0x0 WebView never poisons fresh Turnstile challenges)
+            if (works.isEmpty() && page == 1 && (!hitCloudflare || hasCloudflareClearanceCookie(targetUrl))) {
                 val domJson = evaluateJsInHeadlessWebView(targetUrl, JS_EXTRACT_CATALOG)
                 if (!domJson.isNullOrBlank()) {
                     val domRes = parseCatalogFromDomJson(domJson, site)
@@ -1027,8 +1133,8 @@ object LiveMangaSiteScraper {
             } catch (_: Exception) {
             }
 
-            // Headless WebView fallback if chapters are still empty or hit Cloudflare
-            if (parsedWork.chapters.isEmpty()) {
+            // Headless WebView fallback if chapters are still empty (only run on Cloudflare if cf_clearance already exists)
+            if (parsedWork.chapters.isEmpty() && (!hitCloudflare || hasCloudflareClearanceCookie(targetUrl))) {
                 val domJson = evaluateJsInHeadlessWebView(targetUrl, JS_EXTRACT_DETAILS, timeoutMs = 15_000L)
                 if (!domJson.isNullOrBlank()) {
                     val domRes = parseDetailsFromDomJson(domJson, parsedWork)
@@ -2060,8 +2166,8 @@ object LiveMangaSiteScraper {
             } catch (_: Exception) {
             }
 
-            // 2. If OkHttp found 0 pages (e.g., JS-rendered reader on mangatek.com or Cloudflare), run Headless WebView DOM Extraction!
-            if (pages.isEmpty()) {
+            // 2. If OkHttp found 0 pages (e.g., JS-rendered reader on mangatek.com or Cloudflare with existing clearance), run Headless WebView DOM Extraction!
+            if (pages.isEmpty() && (!hitCloudflare || hasCloudflareClearanceCookie(targetUrl))) {
                 val domJson = evaluateJsInHeadlessWebView(targetUrl, JS_EXTRACT_CHAPTER_PAGES, timeoutMs = 16_000L)
                 if (!domJson.isNullOrBlank()) {
                     val domResult = parseChapterPagesFromDomJson(domJson, targetUrl)
@@ -2675,8 +2781,8 @@ object LiveMangaSiteScraper {
                 }
             }
 
-            // Headless WebView fallback if OkHttp returned 0 updates or hit Cloudflare
-            if (updates.isEmpty()) {
+            // Headless WebView fallback if OkHttp returned 0 updates (only run on Cloudflare if cf_clearance already exists)
+            if (updates.isEmpty() && (!hitCloudflare || hasCloudflareClearanceCookie(targetUrl))) {
                 val domJson = evaluateJsInHeadlessWebView(targetUrl, JS_EXTRACT_LATEST_UPDATES)
                 if (!domJson.isNullOrBlank()) {
                     val domUpdates = parseLatestUpdatesFromDomJson(domJson, site)
@@ -3136,19 +3242,64 @@ object LiveMangaSiteScraper {
 
     // ==================== JAVASCRIPT DOM BRIDGE EXTRACTORS ====================
 
-    val JS_EXTRACT_CATALOG = """
+    /**
+     * Completely passive, read-only check that determines whether the current WebView page is an active
+     * Cloudflare / Turnstile / DDoS-Guard interstitial challenge WITHOUT scrolling, clicking, or mutating the DOM.
+     */
+    val JS_PASSIVE_CHECK_CF_STATUS = """
         (function() {
             var title = document.title || "";
-            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1500) : "";
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1600) : "";
             var hasCfTitle = title.indexOf("Just a moment") !== -1 ||
                              title.indexOf("انتظر لحظة") !== -1 ||
+                             title.indexOf("لحظة واحدة") !== -1 ||
                              title.indexOf("Attention Required") !== -1 ||
-                             title.indexOf("DDOS-GUARD") !== -1;
-            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form");
+                             title.indexOf("DDOS-GUARD") !== -1 ||
+                             title.indexOf("إجراء التحقق من الأمان") !== -1 ||
+                             title.indexOf("Security Check") !== -1;
+            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form, #challenge-error-title, #challenge-body-text, .zone-name-title");
+            var hasTurnstileFrame = !!document.querySelector("iframe[src*='challenges.cloudflare.com'], .cf-turnstile, [id*='cf-chl']");
             var hasCfBody = bodyTxt.indexOf("Verify you are human") !== -1 ||
                             bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
                             bodyTxt.indexOf("يتم الآن التحقق من أنك إنسان") !== -1 ||
                             bodyTxt.indexOf("مراجعة أمان اتصالك") !== -1 ||
+                            bodyTxt.indexOf("إجراء التحقق من الأمان") !== -1 ||
+                            bodyTxt.indexOf("يستخدم هذا الموقع خدمة أمنية للحماية") !== -1 ||
+                            bodyTxt.indexOf("يتحقق موقع الويب من أنك لست روبوت") !== -1 ||
+                            bodyTxt.indexOf("الأداء والأمان من Cloudflare") !== -1 ||
+                            bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1 ||
+                            bodyTxt.indexOf("Checking your browser") !== -1;
+            var linkCount = document.querySelectorAll("a[href]").length;
+            var isCf = hasCfTitle || hasCfStage || ((hasCfBody || hasTurnstileFrame) && linkCount < 8);
+            return JSON.stringify({
+                cf: isCf,
+                readyState: document.readyState || "",
+                title: title,
+                linkCount: linkCount,
+                pageUrl: window.location.href || ""
+            });
+        })();
+    """.trimIndent()
+
+    val JS_EXTRACT_CATALOG = """
+        (function() {
+            var title = document.title || "";
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1600) : "";
+            var hasCfTitle = title.indexOf("Just a moment") !== -1 ||
+                             title.indexOf("انتظر لحظة") !== -1 ||
+                             title.indexOf("لحظة واحدة") !== -1 ||
+                             title.indexOf("Attention Required") !== -1 ||
+                             title.indexOf("DDOS-GUARD") !== -1 ||
+                             title.indexOf("إجراء التحقق من الأمان") !== -1;
+            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form, #challenge-error-title, #challenge-body-text, .zone-name-title");
+            var hasCfBody = bodyTxt.indexOf("Verify you are human") !== -1 ||
+                            bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
+                            bodyTxt.indexOf("يتم الآن التحقق من أنك إنسان") !== -1 ||
+                            bodyTxt.indexOf("مراجعة أمان اتصالك") !== -1 ||
+                            bodyTxt.indexOf("إجراء التحقق من الأمان") !== -1 ||
+                            bodyTxt.indexOf("يستخدم هذا الموقع خدمة أمنية للحماية") !== -1 ||
+                            bodyTxt.indexOf("يتحقق موقع الويب من أنك لست روبوت") !== -1 ||
+                            bodyTxt.indexOf("الأداء والأمان من Cloudflare") !== -1 ||
                             bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1;
             var items = [];
             var seen = {};
@@ -3258,16 +3409,22 @@ object LiveMangaSiteScraper {
     val JS_EXTRACT_LATEST_UPDATES = """
         (function() {
             var title = document.title || "";
-            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1500) : "";
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1600) : "";
             var hasCfTitle = title.indexOf("Just a moment") !== -1 ||
                              title.indexOf("انتظر لحظة") !== -1 ||
+                             title.indexOf("لحظة واحدة") !== -1 ||
                              title.indexOf("Attention Required") !== -1 ||
-                             title.indexOf("DDOS-GUARD") !== -1;
-            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form");
+                             title.indexOf("DDOS-GUARD") !== -1 ||
+                             title.indexOf("إجراء التحقق من الأمان") !== -1;
+            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form, #challenge-error-title, #challenge-body-text, .zone-name-title");
             var hasCfBody = bodyTxt.indexOf("Verify you are human") !== -1 ||
                             bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
                             bodyTxt.indexOf("يتم الآن التحقق من أنك إنسان") !== -1 ||
                             bodyTxt.indexOf("مراجعة أمان اتصالك") !== -1 ||
+                            bodyTxt.indexOf("إجراء التحقق من الأمان") !== -1 ||
+                            bodyTxt.indexOf("يستخدم هذا الموقع خدمة أمنية للحماية") !== -1 ||
+                            bodyTxt.indexOf("يتحقق موقع الويب من أنك لست روبوت") !== -1 ||
+                            bodyTxt.indexOf("الأداء والأمان من Cloudflare") !== -1 ||
                             bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1;
             var updates = [];
             var seen = {};
@@ -3319,23 +3476,31 @@ object LiveMangaSiteScraper {
     val JS_EXTRACT_DETAILS = """
         (function() {
             var title = document.title || "";
-            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1500) : "";
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1600) : "";
             var hasCfTitle = title.indexOf("Just a moment") !== -1 ||
                              title.indexOf("انتظر لحظة") !== -1 ||
+                             title.indexOf("لحظة واحدة") !== -1 ||
                              title.indexOf("Attention Required") !== -1 ||
-                             title.indexOf("DDOS-GUARD") !== -1;
-            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form");
+                             title.indexOf("DDOS-GUARD") !== -1 ||
+                             title.indexOf("إجراء التحقق من الأمان") !== -1;
+            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form, #challenge-error-title, #challenge-body-text, .zone-name-title");
             var hasCfBody = bodyTxt.indexOf("Verify you are human") !== -1 ||
                             bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
                             bodyTxt.indexOf("يتم الآن التحقق من أنك إنسان") !== -1 ||
                             bodyTxt.indexOf("مراجعة أمان اتصالك") !== -1 ||
+                            bodyTxt.indexOf("إجراء التحقق من الأمان") !== -1 ||
+                            bodyTxt.indexOf("يستخدم هذا الموقع خدمة أمنية للحماية") !== -1 ||
+                            bodyTxt.indexOf("يتحقق موقع الويب من أنك لست روبوت") !== -1 ||
+                            bodyTxt.indexOf("الأداء والأمان من Cloudflare") !== -1 ||
                             bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1;
-            try {
-                var moreBtns = document.querySelectorAll(".chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters");
-                for (var m = 0; m < moreBtns.length; m++) {
-                    if (moreBtns[m] && typeof moreBtns[m].click === "function") moreBtns[m].click();
-                }
-            } catch (e) {}
+            if (!hasCfTitle && !hasCfStage && !hasCfBody) {
+                try {
+                    var moreBtns = document.querySelectorAll(".chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters");
+                    for (var m = 0; m < moreBtns.length; m++) {
+                        if (moreBtns[m] && typeof moreBtns[m].click === "function") moreBtns[m].click();
+                    }
+                } catch (e) {}
+            }
             var h1 = document.querySelector(".post-title h1, h1.entry-title, .series-title h1, .manga-title h1, .post-title h2, #info h1, #info h2, main h1, article h1") || document.querySelector("h1");
             var workTitle = h1 ? h1.innerText.trim() : title;
             var coverEl = document.querySelector(".summary_image img, .thumb img, #cover img, .white-bg img, .series-thumb img, .poster img, meta[property='og:image']");
@@ -3457,16 +3622,22 @@ object LiveMangaSiteScraper {
     val JS_EXTRACT_CHAPTER_PAGES = """
         (function() {
             var title = document.title || "";
-            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1500) : "";
+            var bodyTxt = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 1600) : "";
             var hasCfTitle = title.indexOf("Just a moment") !== -1 ||
                              title.indexOf("انتظر لحظة") !== -1 ||
+                             title.indexOf("لحظة واحدة") !== -1 ||
                              title.indexOf("Attention Required") !== -1 ||
-                             title.indexOf("DDOS-GUARD") !== -1;
-            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form");
+                             title.indexOf("DDOS-GUARD") !== -1 ||
+                             title.indexOf("إجراء التحقق من الأمان") !== -1;
+            var hasCfStage = !!document.querySelector("#cf-wrapper, .cf-browser-verification, #challenge-running, #challenge-stage, #cf-challenge-running, form#challenge-form, #challenge-error-title, #challenge-body-text, .zone-name-title");
             var hasCfBody = bodyTxt.indexOf("Verify you are human") !== -1 ||
                             bodyTxt.indexOf("تحقق من أنك إنسان") !== -1 ||
                             bodyTxt.indexOf("يتم الآن التحقق من أنك إنسان") !== -1 ||
                             bodyTxt.indexOf("مراجعة أمان اتصالك") !== -1 ||
+                            bodyTxt.indexOf("إجراء التحقق من الأمان") !== -1 ||
+                            bodyTxt.indexOf("يستخدم هذا الموقع خدمة أمنية للحماية") !== -1 ||
+                            bodyTxt.indexOf("يتحقق موقع الويب من أنك لست روبوت") !== -1 ||
+                            bodyTxt.indexOf("الأداء والأمان من Cloudflare") !== -1 ||
                             bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1;
             var urls = [];
             var seen = {};
@@ -3874,7 +4045,7 @@ object LiveMangaSiteScraper {
         }
     }
 
-    private fun unwrapEvaluateJsString(raw: String): String {
+    fun unwrapEvaluateJsString(raw: String): String {
         val trimmed = raw.trim()
         if (trimmed.length >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
             return try {

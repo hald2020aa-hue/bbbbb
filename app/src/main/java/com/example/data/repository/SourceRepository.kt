@@ -128,20 +128,12 @@ class SourceRepository(
         val capabilities = getCapabilities(site)
         val start = System.currentTimeMillis()
         try {
-            val request = Request.Builder()
-                .url(site.url)
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-                )
-                .build()
+            val request = com.example.data.LiveMangaSiteScraper.buildRequest(site.url, referer = site.url)
             client.newCall(request).execute().use { response ->
                 val elapsed = (System.currentTimeMillis() - start).coerceAtLeast(1L)
                 val code = response.code
                 val bodySample = response.body?.string()?.take(4096) ?: ""
-                val isCloudflare = code in listOf(403, 503) ||
-                    bodySample.contains("cf-browser-verification", ignoreCase = true) ||
-                    bodySample.contains("Just a moment...", ignoreCase = true)
+                val isCloudflare = com.example.data.LiveMangaSiteScraper.isCloudflareChallengeHtml(bodySample, code)
 
                 val statusLabel = when {
                     response.isSuccessful -> "متصل (${elapsed}ms)"

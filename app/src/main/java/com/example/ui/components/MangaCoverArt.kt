@@ -122,9 +122,7 @@ object MangaCoilImageLoader {
                 val original = chain.request()
                 val reqUrl = original.url.toString()
                 val referer = original.header("Referer").orEmpty()
-                val cleanUa = LiveMangaSiteScraper.activeUserAgent
-                    .replace("; wv", "")
-                    .ifBlank { LiveMangaSiteScraper.DEFAULT_USER_AGENT }
+                val cleanUa = LiveMangaSiteScraper.sanitizeWebViewUserAgent(LiveMangaSiteScraper.activeUserAgent)
                 val builder = original.newBuilder()
                 if (original.header("User-Agent").isNullOrBlank()) {
                     builder.header("User-Agent", cleanUa)
@@ -504,7 +502,7 @@ fun ChapterPageIllustration(
                 .memoryCachePolicy(
                     if (retryNonce > 0) CachePolicy.WRITE_ONLY else CachePolicy.ENABLED
                 )
-                .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent.replace("; wv", ""))
+                .addHeader("User-Agent", LiveMangaSiteScraper.sanitizeWebViewUserAgent(LiveMangaSiteScraper.activeUserAgent))
                 .listener(
                     onError = { _, result ->
                         val msg = result.throwable.localizedMessage ?: "خطأ في الاتصال أو الصورة غير مدعومة"
@@ -1135,31 +1133,36 @@ fun HiddenSiteWebViewBridge(
 
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
+                            val targetView = view ?: return
                             CookieManager.getInstance().flush()
-                            val pageTitle = view?.title.orEmpty()
-                            val isChallengeTitle = pageTitle.contains("Just a moment", ignoreCase = true) ||
-                                pageTitle.contains("انتظر لحظة", ignoreCase = true) ||
-                                pageTitle.contains("Attention Required", ignoreCase = true) ||
-                                pageTitle.contains("DDOS-GUARD", ignoreCase = true)
-                            if (!isChallengeTitle) {
-                                // Trigger scroll events & click "show more chapters" buttons only when not on a Cloudflare challenge page
-                                view?.evaluateJavascript(
+                            targetView.evaluateJavascript(LiveMangaSiteScraper.JS_PASSIVE_CHECK_CF_STATUS) { cfRaw ->
+                                val cfUnwrapped = LiveMangaSiteScraper.unwrapEvaluateJsString(cfRaw ?: "")
+                                val isChallenge = cfUnwrapped.contains("\"cf\":true") ||
+                                    LiveMangaSiteScraper.isCloudflareChallengeTitle(targetView.title)
+                                if (isChallenge) {
+                                    // Do NOT inject scroll or click events onto an active Cloudflare challenge page
+                                    if (!cfRaw.isNullOrBlank() && cfRaw != "null") {
+                                        currentOnResultJson(cfRaw)
+                                    }
+                                    return@evaluateJavascript
+                                }
+                                // Trigger scroll events & click "show more chapters" buttons only when verified on a real manga page
+                                targetView.evaluateJavascript(
                                     "(function(){ try { var btns = document.querySelectorAll('.chapter-readmore, .c-chapter-readmore, #btn-read-more, .show-more-chapters'); for(var i=0;i<btns.length;i++){ if(btns[i].click) btns[i].click(); } window.scrollTo(0, 1200); window.scrollTo(0, document.body.scrollHeight); window.scrollTo(0, 0); } catch(e){} })();",
                                     null
                                 )
-                            }
-                            val pollDelays = if (isChallengeTitle) listOf(900L) else listOf(500L, 1600L)
-                            for (delayMs in pollDelays) {
-                                view?.postDelayed({
-                                    try {
-                                        view.evaluateJavascript(currentJsScript) { rawJson ->
-                                            if (!rawJson.isNullOrBlank() && rawJson != "null") {
-                                                currentOnResultJson(rawJson)
+                                for (delayMs in listOf(450L, 1500L)) {
+                                    targetView.postDelayed({
+                                        try {
+                                            targetView.evaluateJavascript(currentJsScript) { rawJson ->
+                                                if (!rawJson.isNullOrBlank() && rawJson != "null") {
+                                                    currentOnResultJson(rawJson)
+                                                }
                                             }
+                                        } catch (_: Exception) {
                                         }
-                                    } catch (_: Exception) {
-                                    }
-                                }, delayMs)
+                                    }, delayMs)
+                                }
                             }
                         }
                     }
@@ -1181,7 +1184,7 @@ fun HiddenSiteWebViewBridge(
  * Lets the user manually bypass Cloudflare / Turnstile challenges without background WebView or JS interference,
  * and extracts & displays the manga natively inside the app as soon as verification completes.
  */
-@SuppressLint("SetJavaScriptEnabled")
+@SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
 @Composable
 fun CloudflareProtectionDialog(
     url: String,
@@ -1201,27 +1204,7 @@ fun CloudflareProtectionDialog(
     }
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
 
-    fun inspectAndExtractFromRealPage(view: WebView?, forceExtract: Boolean = false, onDone: (() -> Unit)? = null) {
-        val targetView = view ?: run {
-            onDone?.invoke()
-            return
-        }
-        val script = currentJsExtractorScript ?: run {
-            onDone?.invoke()
-            return
-        }
-        val pageTitle = targetView.title.orEmpty()
-        val isChallengeTitle = pageTitle.contains("Just a moment", ignoreCase = true) ||
-            pageTitle.contains("انتظر لحظة", ignoreCase = true) ||
-            pageTitle.contains("Attention Required", ignoreCase = true) ||
-            pageTitle.contains("DDOS-GUARD", ignoreCase = true)
-
-        if (isChallengeTitle && !forceExtract) {
-            statusBannerText = "يرجى الضغط على مربع التحقق البشري والانتظار لثوانٍ حتى يفتح الموقع..."
-            onDone?.invoke()
-            return
-        }
-
+    fun runExtractionOnVerifiedPage(targetView: WebView, script: String, forceExtract: Boolean, onDone: (() -> Unit)?) {
         try {
             CookieManager.getInstance().flush()
             targetView.evaluateJavascript(
@@ -1230,13 +1213,14 @@ fun CloudflareProtectionDialog(
             )
             targetView.evaluateJavascript(script) { rawJson ->
                 if (!rawJson.isNullOrBlank() && rawJson != "null") {
-                    val isStillChallenge = rawJson.contains("\"cf\":true")
-                    val hasRealContent = rawJson.contains("\"items\":[{") ||
-                        rawJson.contains("\"chapters\":[{") ||
-                        rawJson.contains("\"galleryPages\":[\"") ||
-                        rawJson.contains("\"pages\":[\"") ||
-                        rawJson.contains("\"updates\":[{") ||
-                        (!isStillChallenge && rawJson.contains("\"html\":\"<"))
+                    val unwrapped = LiveMangaSiteScraper.unwrapEvaluateJsString(rawJson)
+                    val isStillChallenge = unwrapped.contains("\"cf\":true")
+                    val hasRealContent = unwrapped.contains("\"items\":[{") ||
+                        unwrapped.contains("\"chapters\":[{") ||
+                        unwrapped.contains("\"galleryPages\":[\"") ||
+                        unwrapped.contains("\"pages\":[\"") ||
+                        unwrapped.contains("\"updates\":[{") ||
+                        (!isStillChallenge && unwrapped.contains("\"html\":\"<"))
                     if (hasRealContent && !isStillChallenge) {
                         CookieManager.getInstance().flush()
                         currentOnExtractedDomJson?.invoke(rawJson)
@@ -1250,6 +1234,54 @@ fun CloudflareProtectionDialog(
             }
         } catch (_: Throwable) {
             onDone?.invoke()
+        }
+    }
+
+    fun inspectAndExtractFromRealPage(view: WebView?, forceExtract: Boolean = false, onDone: (() -> Unit)? = null) {
+        val targetView = view ?: run {
+            onDone?.invoke()
+            return
+        }
+        val script = currentJsExtractorScript ?: run {
+            if (forceExtract) {
+                CookieManager.getInstance().flush()
+            }
+            onDone?.invoke()
+            return
+        }
+
+        if (forceExtract) {
+            runExtractionOnVerifiedPage(targetView, script, forceExtract = true, onDone = onDone)
+            return
+        }
+
+        // First perform a 100% passive, read-only check so we NEVER scroll or mutate the DOM while Turnstile is active
+        try {
+            targetView.evaluateJavascript(LiveMangaSiteScraper.JS_PASSIVE_CHECK_CF_STATUS) { cfRaw ->
+                val cfUnwrapped = LiveMangaSiteScraper.unwrapEvaluateJsString(cfRaw ?: "")
+                val isChallenge = cfUnwrapped.contains("\"cf\":true") ||
+                    LiveMangaSiteScraper.isCloudflareChallengeTitle(targetView.title)
+                if (isChallenge) {
+                    statusBannerText = "يرجى الضغط على مربع التحقق البشري والانتظار لثوانٍ حتى يفتح الموقع..."
+                    onDone?.invoke()
+                } else {
+                    statusBannerText = "تم فتح الصفحة! جارٍ استخراج المانجا وعرضها بالتطبيق..."
+                    runExtractionOnVerifiedPage(targetView, script, forceExtract = false, onDone = onDone)
+                }
+            }
+        } catch (_: Throwable) {
+            onDone?.invoke()
+        }
+    }
+
+    // Periodically run the passive check so as soon as Turnstile redirects to the real page, it auto-extracts and closes
+    LaunchedEffect(webViewInstance, isVerifiedSuccess) {
+        val view = webViewInstance ?: return@LaunchedEffect
+        while (!isVerifiedSuccess) {
+            kotlinx.coroutines.delay(1400L)
+            if (!isVerifiedSuccess && !isLoadingPage) {
+                inspectAndExtractFromRealPage(view, forceExtract = false)
+            }
         }
     }
 
@@ -1320,7 +1352,14 @@ fun CloudflareProtectionDialog(
                     }
 
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { webViewInstance?.reload() }) {
+                        IconButton(
+                            onClick = {
+                                if (!LiveMangaSiteScraper.hasCloudflareClearanceCookie(url)) {
+                                    LiveMangaSiteScraper.clearStaleCloudflareChallengeCookies(url)
+                                }
+                                webViewInstance?.reload()
+                            }
+                        ) {
                             Icon(Icons.Default.Refresh, contentDescription = "تحديث", tint = TextPrimaryWhite)
                         }
                         IconButton(onClick = currentOnDismissAndRefresh) {
@@ -1339,25 +1378,31 @@ fun CloudflareProtectionDialog(
                         modifier = Modifier.fillMaxSize(),
                         factory = { ctx ->
                             WebView(ctx).apply {
+                                layoutParams = ViewGroup.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT
+                                )
                                 isFocusable = true
                                 isFocusableInTouchMode = true
+                                requestFocus()
+                                setOnTouchListener { v, event ->
+                                    if ((event.action == android.view.MotionEvent.ACTION_DOWN ||
+                                            event.action == android.view.MotionEvent.ACTION_UP) && !v.hasFocus()
+                                    ) {
+                                        v.requestFocus()
+                                    }
+                                    false
+                                }
                                 LiveMangaSiteScraper.configureWebViewForSite(this, loadImages = true)
+                                if (!LiveMangaSiteScraper.hasCloudflareClearanceCookie(url)) {
+                                    LiveMangaSiteScraper.clearStaleCloudflareChallengeCookies(url)
+                                }
 
                                 webChromeClient = object : WebChromeClient() {
                                     override fun onReceivedTitle(view: WebView?, title: String?) {
                                         super.onReceivedTitle(view, title)
-                                        val t = title.orEmpty()
-                                        val isCfTitle = t.contains("Just a moment", ignoreCase = true) ||
-                                            t.contains("انتظر لحظة", ignoreCase = true) ||
-                                            t.contains("Attention Required", ignoreCase = true) ||
-                                            t.contains("DDOS-GUARD", ignoreCase = true)
-                                        if (!isCfTitle && t.isNotBlank()) {
-                                            statusBannerText = "تم فتح الصفحة! جارٍ استخراج المانجا وعرضها بالتطبيق..."
-                                            view?.postDelayed({
-                                                if (!isVerifiedSuccess) {
-                                                    inspectAndExtractFromRealPage(view, forceExtract = false)
-                                                }
-                                            }, 650L)
+                                        if (LiveMangaSiteScraper.isCloudflareChallengeTitle(title)) {
+                                            statusBannerText = "يرجى الضغط على مربع التحقق البشري والانتظار لثوانٍ حتى يفتح الموقع..."
                                         }
                                     }
                                 }
@@ -1376,22 +1421,12 @@ fun CloudflareProtectionDialog(
                                         super.onPageFinished(view, finishedUrl)
                                         isLoadingPage = false
                                         CookieManager.getInstance().flush()
-                                        // Only run extraction if the finished page is NOT the Cloudflare challenge interstitial
-                                        val t = view?.title.orEmpty()
-                                        val isCfTitle = t.contains("Just a moment", ignoreCase = true) ||
-                                            t.contains("انتظر لحظة", ignoreCase = true) ||
-                                            t.contains("Attention Required", ignoreCase = true) ||
-                                            t.contains("DDOS-GUARD", ignoreCase = true)
-                                        if (!isCfTitle) {
-                                            for (delayMs in listOf(550L, 1700L, 3000L)) {
-                                                view?.postDelayed({
-                                                    if (!isVerifiedSuccess) {
-                                                        inspectAndExtractFromRealPage(view, forceExtract = false)
-                                                    }
-                                                }, delayMs)
-                                            }
-                                        } else {
-                                            statusBannerText = "أكمل التحقق البشري في الصفحة أدناه ليتم فتح الموقع تلقائياً"
+                                        for (delayMs in listOf(600L, 1800L)) {
+                                            view?.postDelayed({
+                                                if (!isVerifiedSuccess) {
+                                                    inspectAndExtractFromRealPage(view, forceExtract = false)
+                                                }
+                                            }, delayMs)
                                         }
                                     }
                                 }

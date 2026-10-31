@@ -416,7 +416,7 @@ fun MangaChapterReaderScreen(
                         .data(url)
                         .crossfade(false)
                         .addHeader("Referer", referer)
-                        .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent.replace("; wv", ""))
+                        .addHeader("User-Agent", LiveMangaSiteScraper.sanitizeWebViewUserAgent(LiveMangaSiteScraper.activeUserAgent))
                         .memoryCacheKey(url)
                         .diskCacheKey(url)
                     if (cookie.isNotBlank()) {
@@ -498,7 +498,7 @@ fun MangaChapterReaderScreen(
                                 val req = coil.request.ImageRequest.Builder(readerContext)
                                     .data(nextImgUrl)
                                     .setHeader("Referer", targetNext.chapterUrl)
-                                    .setHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent.replace("; wv", ""))
+                                    .setHeader("User-Agent", LiveMangaSiteScraper.sanitizeWebViewUserAgent(LiveMangaSiteScraper.activeUserAgent))
                                     .memoryCacheKey(nextImgUrl)
                                     .diskCacheKey(nextImgUrl)
                                     .build()

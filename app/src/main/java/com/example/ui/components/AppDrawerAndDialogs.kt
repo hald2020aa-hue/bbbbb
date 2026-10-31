@@ -686,32 +686,40 @@ fun AddSiteFlowDialog(
                                     modifier = Modifier.fillMaxSize(),
                                     factory = { ctx ->
                                         WebView(ctx).apply {
-                                            val cm = CookieManager.getInstance()
-                                            cm.setAcceptCookie(true)
-                                            cm.setAcceptThirdPartyCookies(this, true)
-                                            settings.javaScriptEnabled = true
-                                            settings.domStorageEnabled = true
-                                            settings.databaseEnabled = true
-                                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                                            val ua = settings.userAgentString
-                                            if (!ua.isNullOrBlank()) {
-                                                LiveMangaSiteScraper.activeUserAgent = ua.replace("; wv", "")
-                                                settings.userAgentString = LiveMangaSiteScraper.activeUserAgent
+                                            isFocusable = true
+                                            isFocusableInTouchMode = true
+                                            requestFocus()
+                                            setOnTouchListener { v, event ->
+                                                if ((event.action == android.view.MotionEvent.ACTION_DOWN ||
+                                                        event.action == android.view.MotionEvent.ACTION_UP) && !v.hasFocus()
+                                                ) {
+                                                    v.requestFocus()
+                                                }
+                                                false
+                                            }
+                                            LiveMangaSiteScraper.configureWebViewForSite(this, loadImages = true)
+                                            if (!LiveMangaSiteScraper.hasCloudflareClearanceCookie(state.verificationUrl)) {
+                                                LiveMangaSiteScraper.clearStaleCloudflareChallengeCookies(state.verificationUrl)
                                             }
                                             webViewClient = object : WebViewClient() {
                                                 override fun onPageFinished(view: WebView?, url: String?) {
                                                     super.onPageFinished(view, url)
+                                                    val targetView = view ?: return
                                                     try {
                                                         CookieManager.getInstance().flush()
                                                     } catch (_: Throwable) {}
-                                                    val pageTitle = view?.title
-                                                    if (!pageTitle.isNullOrBlank() &&
-                                                        !pageTitle.contains("Just a moment", ignoreCase = true) &&
-                                                        !pageTitle.contains("Cloudflare", ignoreCase = true)
-                                                    ) {
-                                                        view.postDelayed({
-                                                            onVerificationCompleted(pageTitle)
-                                                        }, 400L)
+                                                    targetView.evaluateJavascript(LiveMangaSiteScraper.JS_PASSIVE_CHECK_CF_STATUS) { cfRaw ->
+                                                        val cfUnwrapped = LiveMangaSiteScraper.unwrapEvaluateJsString(cfRaw ?: "")
+                                                        val pageTitle = targetView.title.orEmpty()
+                                                        val isCf = cfUnwrapped.contains("\"cf\":true") ||
+                                                            LiveMangaSiteScraper.isCloudflareChallengeTitle(pageTitle) ||
+                                                            pageTitle.contains("Cloudflare", ignoreCase = true)
+                                                        if (!isCf && pageTitle.isNotBlank()) {
+                                                            targetView.postDelayed({
+                                                                CookieManager.getInstance().flush()
+                                                                onVerificationCompleted(pageTitle)
+                                                            }, 400L)
+                                                        }
                                                     }
                                                 }
                                             }

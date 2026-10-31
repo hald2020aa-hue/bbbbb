@@ -165,8 +165,37 @@ class ExampleUnitTest {
         // Verify Arabic Cloudflare interstitial detection
         val cfArabicHtml = "<html><head><title>انتظر لحظة...</title></head><body>يتم الآن التحقق من أنك إنسان. قد يستغرق هذا بضع ثوانٍ.</body></html>"
         assertTrue(LiveMangaSiteScraper.isCloudflareChallengeHtml(cfArabicHtml, 403))
+
+        // Verify exact Arabic Cloudflare Turnstile page from video ("لحظة واحدة...", "إجراء التحقق من الأمان", "يستخدم هذا الموقع خدمة أمنية للحماية")
+        val cfVideoHtml = """
+            <html>
+            <head><title>لحظة واحدة...</title></head>
+            <body>
+                <h1 class="zone-name-title">hentairead.com</h1>
+                <h2 id="challenge-body-text">إجراء التحقق من الأمان</h2>
+                <div>يستخدم هذا الموقع خدمة أمنية للحماية من برامج الروبوتات الضارة. يتحقق موقع الويب من أنك لست روبوتًا.</div>
+                <div>Ray ID: a5320bb219e64cc9</div>
+                <div>الأداء والأمان من Cloudflare</div>
+            </body>
+            </html>
+        """.trimIndent()
+        assertTrue(LiveMangaSiteScraper.isCloudflareChallengeHtml(cfVideoHtml, 200))
+        assertTrue(LiveMangaSiteScraper.isCloudflareChallengeTitle("لحظة واحدة..."))
+        assertTrue(LiveMangaSiteScraper.isCloudflareChallengeTitle("إجراء التحقق من الأمان"))
+        assertFalse(LiveMangaSiteScraper.isCloudflareChallengeTitle("HentaiRead - Read Manga Online"))
+
+        // Verify User-Agent sanitization removes "; wv" and "Version/4.0" while preserving exact Chrome version & device model
+        val rawWebViewUa = "Mozilla/5.0 (Linux; Android 14; SM-S918B Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/130.0.6723.106 Mobile Safari/537.36"
+        val sanitizedUa = LiveMangaSiteScraper.sanitizeWebViewUserAgent(rawWebViewUa)
+        assertFalse(sanitizedUa.contains("; wv"))
+        assertFalse(sanitizedUa.contains("Version/4.0"))
+        assertTrue(sanitizedUa.contains("Chrome/130.0.6723.106"))
+        assertTrue(sanitizedUa.contains("SM-S918B"))
+
+        // Verify unwrapEvaluateJsString unwraps double-encoded JSON returned by WebView.evaluateJavascript
+        val doubleEncoded = "\"{\\\"cf\\\":false,\\\"items\\\":[{\\\"title\\\":\\\"Test\\\",\\\"url\\\":\\\"https://hentairead.com/hentai/test/\\\",\\\"cover\\\":\\\"https://hentairead.com/c.jpg\\\"}]}\""
+        val unwrapped = LiveMangaSiteScraper.unwrapEvaluateJsString(doubleEncoded)
+        assertTrue(unwrapped.contains("\"cf\":false"))
+        assertTrue(unwrapped.contains("\"items\":[{"))
     }
 }
-
-
-

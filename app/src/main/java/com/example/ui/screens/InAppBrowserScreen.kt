@@ -452,26 +452,23 @@ fun InAppBrowserScreen(
                     modifier = Modifier.fillMaxSize(),
                     factory = { ctx ->
                         WebView(ctx).apply {
-                            val cookieManager = CookieManager.getInstance()
-                            cookieManager.setAcceptCookie(true)
-                            cookieManager.setAcceptThirdPartyCookies(this, true)
+                            isFocusable = true
+                            isFocusableInTouchMode = true
+                            requestFocus()
+                            setOnTouchListener { v, event ->
+                                if ((event.action == android.view.MotionEvent.ACTION_DOWN ||
+                                        event.action == android.view.MotionEvent.ACTION_UP) && !v.hasFocus()
+                                ) {
+                                    v.requestFocus()
+                                }
+                                false
+                            }
+                            com.example.data.LiveMangaSiteScraper.configureWebViewForSite(this, loadImages = true)
 
                             settings.apply {
-                                javaScriptEnabled = true
-                                domStorageEnabled = true
-                                databaseEnabled = true
-                                loadsImagesAutomatically = true
-                                // Section 11: Strict WebView security settings
-                                allowFileAccess = false
-                                allowContentAccess = false
-                                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-                                useWideViewPort = true
-                                loadWithOverviewMode = true
                                 builtInZoomControls = true
                                 displayZoomControls = false
                                 setSupportZoom(true)
-                                userAgentString =
-                                    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
                             }
                             webViewClient = object : WebViewClient() {
                                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
