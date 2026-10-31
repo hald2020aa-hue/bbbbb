@@ -197,5 +197,84 @@ class ExampleUnitTest {
         val unwrapped = LiveMangaSiteScraper.unwrapEvaluateJsString(doubleEncoded)
         assertTrue(unwrapped.contains("\"cf\":false"))
         assertTrue(unwrapped.contains("\"items\":[{"))
+
+        // Verify pure-Kotlin challenge title check avoids JS evaluation during Turnstile
+        assertTrue(LiveMangaSiteScraper.isLikelyStillOnChallengeOrLoadingTitle("لحظة واحدة...", "https://hentairead.com/"))
+        assertTrue(LiveMangaSiteScraper.isLikelyStillOnChallengeOrLoadingTitle("hentairead.com", "https://hentairead.com/"))
+        assertTrue(LiveMangaSiteScraper.isLikelyStillOnChallengeOrLoadingTitle("", "https://hentairead.com/"))
+        assertFalse(LiveMangaSiteScraper.isLikelyStillOnChallengeOrLoadingTitle("HentaiRead - Read Manga Online", "https://hentairead.com/"))
+    }
+
+    @Test
+    fun parseCatalogHtml_extractsAllMangaAndManhwaCardsIncludingSeparateThumbnailAndTitleLinks() {
+        val site = com.example.data.local.SiteEntity(
+            id = 88L,
+            name = "Olympus",
+            url = "https://olympustaff.com",
+            domain = "olympustaff.com",
+            iconKey = "globe"
+        )
+        // Includes:
+        // 1) Separate thumbnail <a><img></a> (no alt/title) + sibling <h3><a>Title</a></h3>
+        // 2) Slugs containing words like "random", "popular", "history" that previously got rejected
+        // 3) Cover <img> outside the <a> tag inside a wrapper div
+        val html = """
+            <html>
+            <body>
+                <div class="featured-slider">
+                    <div class="slide-item">
+                        <a href="https://olympustaff.com/series/solo-leveling-ragnarok/">
+                            <img src="https://olympustaff.com/uploads/solo.webp" />
+                        </a>
+                        <div class="slide-info">
+                            <h3><a href="https://olympustaff.com/series/solo-leveling-ragnarok/">Solo Leveling: Ragnarok</a></h3>
+                        </div>
+                    </div>
+                </div>
+                <div class="listupd">
+                    <div class="bs">
+                        <div class="bsx">
+                            <a href="https://olympustaff.com/manga/random-chat/">
+                                <div class="limit"><img src="https://olympustaff.com/uploads/random-chat.jpg" /></div>
+                            </a>
+                            <div class="bigor">
+                                <div class="tt"><a href="https://olympustaff.com/manga/random-chat/">Random Chat Manhwa</a></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="bs">
+                        <div class="bsx">
+                            <a href="https://olympustaff.com/manga/popular-martial-god/">
+                                <div class="limit"><img data-src="https://olympustaff.com/uploads/martial-god.jpg" /></div>
+                            </a>
+                            <div class="bigor">
+                                <h3><a href="https://olympustaff.com/manga/popular-martial-god/">Popular Martial God</a></h3>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="custom-card">
+                        <div class="thumb-wrap">
+                            <img src="https://olympustaff.com/uploads/history-kingdoms.png" />
+                        </div>
+                        <div class="info-wrap">
+                            <h4><a href="https://olympustaff.com/manhwa/history-of-three-kingdoms/">History of Three Kingdoms</a></h4>
+                        </div>
+                    </div>
+                </div>
+            </body>
+            </html>
+        """.trimIndent()
+
+        val works = LiveMangaSiteScraper.parseCatalogHtml(html, site, "https://olympustaff.com/")
+        assertEquals(4, works.size)
+        assertEquals(
+            listOf(
+                "Solo Leveling: Ragnarok",
+                "Random Chat Manhwa",
+                "Popular Martial God",
+                "History of Three Kingdoms"
+            ),
+            works.map { it.title }
+        )
     }
 }

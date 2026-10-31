@@ -416,7 +416,7 @@ fun MangaChapterReaderScreen(
                         .data(url)
                         .crossfade(false)
                         .addHeader("Referer", referer)
-                        .addHeader("User-Agent", LiveMangaSiteScraper.sanitizeWebViewUserAgent(LiveMangaSiteScraper.activeUserAgent))
+                        .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent)
                         .memoryCacheKey(url)
                         .diskCacheKey(url)
                     if (cookie.isNotBlank()) {

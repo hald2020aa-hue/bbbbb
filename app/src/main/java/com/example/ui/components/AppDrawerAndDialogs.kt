@@ -698,9 +698,6 @@ fun AddSiteFlowDialog(
                                                 false
                                             }
                                             LiveMangaSiteScraper.configureWebViewForSite(this, loadImages = true)
-                                            if (!LiveMangaSiteScraper.hasCloudflareClearanceCookie(state.verificationUrl)) {
-                                                LiveMangaSiteScraper.clearStaleCloudflareChallengeCookies(state.verificationUrl)
-                                            }
                                             webViewClient = object : WebViewClient() {
                                                 override fun onPageFinished(view: WebView?, url: String?) {
                                                     super.onPageFinished(view, url)
@@ -708,16 +705,20 @@ fun AddSiteFlowDialog(
                                                     try {
                                                         CookieManager.getInstance().flush()
                                                     } catch (_: Throwable) {}
+                                                    val pageTitle = targetView.title.orEmpty()
+                                                    if (LiveMangaSiteScraper.isLikelyStillOnChallengeOrLoadingTitle(pageTitle, state.verificationUrl)) {
+                                                        return
+                                                    }
                                                     targetView.evaluateJavascript(LiveMangaSiteScraper.JS_PASSIVE_CHECK_CF_STATUS) { cfRaw ->
                                                         val cfUnwrapped = LiveMangaSiteScraper.unwrapEvaluateJsString(cfRaw ?: "")
-                                                        val pageTitle = targetView.title.orEmpty()
+                                                        val currentTitle = targetView.title.orEmpty()
                                                         val isCf = cfUnwrapped.contains("\"cf\":true") ||
-                                                            LiveMangaSiteScraper.isCloudflareChallengeTitle(pageTitle) ||
-                                                            pageTitle.contains("Cloudflare", ignoreCase = true)
-                                                        if (!isCf && pageTitle.isNotBlank()) {
+                                                            LiveMangaSiteScraper.isCloudflareChallengeTitle(currentTitle) ||
+                                                            currentTitle.contains("Cloudflare", ignoreCase = true)
+                                                        if (!isCf && currentTitle.isNotBlank()) {
                                                             targetView.postDelayed({
                                                                 CookieManager.getInstance().flush()
-                                                                onVerificationCompleted(pageTitle)
+                                                                onVerificationCompleted(currentTitle)
                                                             }, 400L)
                                                         }
                                                     }

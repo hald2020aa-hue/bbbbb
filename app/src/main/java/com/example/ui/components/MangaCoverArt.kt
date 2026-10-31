@@ -122,7 +122,7 @@ object MangaCoilImageLoader {
                 val original = chain.request()
                 val reqUrl = original.url.toString()
                 val referer = original.header("Referer").orEmpty()
-                val cleanUa = LiveMangaSiteScraper.sanitizeWebViewUserAgent(LiveMangaSiteScraper.activeUserAgent)
+                val cleanUa = LiveMangaSiteScraper.activeUserAgent
                 val builder = original.newBuilder()
                 if (original.header("User-Agent").isNullOrBlank()) {
                     builder.header("User-Agent", cleanUa)
@@ -502,7 +502,7 @@ fun ChapterPageIllustration(
                 .memoryCachePolicy(
                     if (retryNonce > 0) CachePolicy.WRITE_ONLY else CachePolicy.ENABLED
                 )
-                .addHeader("User-Agent", LiveMangaSiteScraper.sanitizeWebViewUserAgent(LiveMangaSiteScraper.activeUserAgent))
+                .addHeader("User-Agent", LiveMangaSiteScraper.activeUserAgent)
                 .listener(
                     onError = { _, result ->
                         val msg = result.throwable.localizedMessage ?: "خطأ في الاتصال أو الصورة غير مدعومة"
@@ -1203,6 +1203,9 @@ fun CloudflareProtectionDialog(
         mutableStateOf("أكمل التحقق البشري في الصفحة أدناه ليتم عرض المانجا تلقائياً داخل التطبيق")
     }
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
+    val hadClearanceInitially = remember(url) {
+        LiveMangaSiteScraper.hasCloudflareClearanceCookie(url)
+    }
 
     fun runExtractionOnVerifiedPage(targetView: WebView, script: String, forceExtract: Boolean, onDone: (() -> Unit)?) {
         try {
@@ -1255,7 +1258,19 @@ fun CloudflareProtectionDialog(
             return
         }
 
-        // First perform a 100% passive, read-only check so we NEVER scroll or mutate the DOM while Turnstile is active
+        // CRITICAL: Check WebView title in pure Kotlin first!
+        // While Turnstile is active ("لحظة واحدة...", "Just a moment...", or bare domain before cf_clearance),
+        // do NOT call evaluateJavascript AT ALL so Turnstile's Web Worker and Proof-of-Work run with zero interference.
+        val currentTitle = targetView.title
+        val newlyEarnedClearance = !hadClearanceInitially && LiveMangaSiteScraper.hasCloudflareClearanceCookie(url)
+        if (LiveMangaSiteScraper.isCloudflareChallengeTitle(currentTitle) ||
+            (!newlyEarnedClearance && LiveMangaSiteScraper.isLikelyStillOnChallengeOrLoadingTitle(currentTitle, url))
+        ) {
+            statusBannerText = "يرجى الضغط على مربع التحقق البشري والانتظار لثوانٍ حتى يفتح الموقع..."
+            onDone?.invoke()
+            return
+        }
+
         try {
             targetView.evaluateJavascript(LiveMangaSiteScraper.JS_PASSIVE_CHECK_CF_STATUS) { cfRaw ->
                 val cfUnwrapped = LiveMangaSiteScraper.unwrapEvaluateJsString(cfRaw ?: "")
@@ -1274,13 +1289,20 @@ fun CloudflareProtectionDialog(
         }
     }
 
-    // Periodically run the passive check so as soon as Turnstile redirects to the real page, it auto-extracts and closes
+    // Pure-Kotlin watcher: checks WebView.getTitle() and CookieManager without touching the JS bridge
+    // while Turnstile is running, and triggers extraction only after the real site title or cf_clearance arrives.
     LaunchedEffect(webViewInstance, isVerifiedSuccess) {
         val view = webViewInstance ?: return@LaunchedEffect
         while (!isVerifiedSuccess) {
-            kotlinx.coroutines.delay(1400L)
+            kotlinx.coroutines.delay(1500L)
             if (!isVerifiedSuccess && !isLoadingPage) {
-                inspectAndExtractFromRealPage(view, forceExtract = false)
+                val pageTitle = view.title
+                val hasNewClearance = !hadClearanceInitially && LiveMangaSiteScraper.hasCloudflareClearanceCookie(url)
+                if (!LiveMangaSiteScraper.isCloudflareChallengeTitle(pageTitle) &&
+                    (hasNewClearance || !LiveMangaSiteScraper.isLikelyStillOnChallengeOrLoadingTitle(pageTitle, url))
+                ) {
+                    inspectAndExtractFromRealPage(view, forceExtract = false)
+                }
             }
         }
     }
@@ -1394,15 +1416,18 @@ fun CloudflareProtectionDialog(
                                     false
                                 }
                                 LiveMangaSiteScraper.configureWebViewForSite(this, loadImages = true)
-                                if (!LiveMangaSiteScraper.hasCloudflareClearanceCookie(url)) {
-                                    LiveMangaSiteScraper.clearStaleCloudflareChallengeCookies(url)
-                                }
 
                                 webChromeClient = object : WebChromeClient() {
                                     override fun onReceivedTitle(view: WebView?, title: String?) {
                                         super.onReceivedTitle(view, title)
                                         if (LiveMangaSiteScraper.isCloudflareChallengeTitle(title)) {
                                             statusBannerText = "يرجى الضغط على مربع التحقق البشري والانتظار لثوانٍ حتى يفتح الموقع..."
+                                        } else if (!LiveMangaSiteScraper.isLikelyStillOnChallengeOrLoadingTitle(title, url)) {
+                                            view?.postDelayed({
+                                                if (!isVerifiedSuccess && !isLoadingPage) {
+                                                    inspectAndExtractFromRealPage(view, forceExtract = false)
+                                                }
+                                            }, 900L)
                                         }
                                     }
                                 }
@@ -1421,12 +1446,16 @@ fun CloudflareProtectionDialog(
                                         super.onPageFinished(view, finishedUrl)
                                         isLoadingPage = false
                                         CookieManager.getInstance().flush()
-                                        for (delayMs in listOf(600L, 1800L)) {
+                                        val pageTitle = view?.title
+                                        val hasNewClearance = !hadClearanceInitially && LiveMangaSiteScraper.hasCloudflareClearanceCookie(url)
+                                        if (!LiveMangaSiteScraper.isCloudflareChallengeTitle(pageTitle) &&
+                                            (hasNewClearance || !LiveMangaSiteScraper.isLikelyStillOnChallengeOrLoadingTitle(pageTitle, url))
+                                        ) {
                                             view?.postDelayed({
                                                 if (!isVerifiedSuccess) {
                                                     inspectAndExtractFromRealPage(view, forceExtract = false)
                                                 }
-                                            }, delayMs)
+                                            }, 900L)
                                         }
                                     }
                                 }

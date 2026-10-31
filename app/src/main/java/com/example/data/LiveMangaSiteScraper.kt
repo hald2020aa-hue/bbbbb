@@ -90,16 +90,16 @@ object LiveMangaSiteScraper {
         try {
             val defaultUa = WebSettings.getDefaultUserAgent(appCtx)
             if (!defaultUa.isNullOrBlank()) {
-                activeUserAgent = sanitizeWebViewUserAgent(defaultUa)
+                activeUserAgent = defaultUa
             }
         } catch (_: Throwable) {
         }
     }
 
     /**
-     * Removes Android WebView markers ("; wv" and "Version/X.X") from the device's genuine WebView User-Agent
-     * while preserving the exact Chromium version and device model so Sec-CH-UA / navigator.userAgentData
-     * inside Cloudflare Turnstile iframes match the HTTP User-Agent header 100%.
+     * Helper for tests or custom headers when a stripped User-Agent is explicitly requested.
+     * Note: WebViews MUST keep their genuine native User-Agent so window.navigator.userAgent,
+     * WorkerNavigator.userAgent (inside Turnstile Web Workers), and Sec-CH-UA match 100%.
      */
     fun sanitizeWebViewUserAgent(rawUa: String): String {
         if (rawUa.isBlank()) return DEFAULT_USER_AGENT
@@ -118,8 +118,8 @@ object LiveMangaSiteScraper {
     }
 
     /**
-     * Clears transient Cloudflare challenge state/retry cookies (__cf_bm, cf_chl_*) before starting a fresh
-     * interactive verification so failed headless or prior attempts do not cause an infinite Turnstile loop.
+     * Clears transient Cloudflare retry counters only when explicitly requested on manual reload.
+     * Does NOT overwrite __cf_bm with empty domain cookies so Turnstile session state remains intact.
      */
     fun clearStaleCloudflareChallengeCookies(url: String) {
         if (url.isBlank()) return
@@ -128,27 +128,16 @@ object LiveMangaSiteScraper {
             val uri = URI(url.trim())
             val host = uri.host ?: return
             val scheme = uri.scheme ?: "https"
-            val rootDomain = host.removePrefix("www.")
+            val origin = "$scheme://$host"
             val staleCookieNames = listOf(
-                "__cf_bm",
                 "cf_chl_2",
                 "cf_chl_prog",
                 "cf_chl_rc_ni",
                 "cf_chl_rc_m",
                 "cf_chl_seq_ni"
             )
-            val origins = listOf(
-                "$scheme://$host",
-                "$scheme://$rootDomain",
-                "https://$host",
-                "https://$rootDomain"
-            ).distinct()
-            for (origin in origins) {
-                for (name in staleCookieNames) {
-                    cm.setCookie(origin, "$name=; Max-Age=0; Path=/")
-                    cm.setCookie(origin, "$name=; Max-Age=0; Domain=.$rootDomain; Path=/")
-                    cm.setCookie(origin, "$name=; Max-Age=0; Domain=$rootDomain; Path=/")
-                }
+            for (name in staleCookieNames) {
+                cm.setCookie(origin, "$name=; Max-Age=0; Path=/")
             }
             cm.flush()
         } catch (_: Throwable) {
@@ -166,6 +155,28 @@ object LiveMangaSiteScraper {
             t.contains("إجراء التحقق من الأمان", ignoreCase = true) ||
             t.contains("Security Check", ignoreCase = true) ||
             t.contains("Checking your browser", ignoreCase = true)
+    }
+
+    /**
+     * Pure Kotlin check (zero evaluateJavascript calls) to determine whether a WebView is still on
+     * a Cloudflare / Turnstile challenge or transient loading state based on WebView.getTitle().
+     */
+    fun isLikelyStillOnChallengeOrLoadingTitle(title: String?, targetUrl: String): Boolean {
+        val t = title?.trim().orEmpty()
+        if (t.isBlank()) return true
+        if (isCloudflareChallengeTitle(t)) return true
+        val lower = t.lowercase(Locale.ROOT)
+        if (lower.startsWith("http://") || lower.startsWith("https://") ||
+            lower.contains("__cf_chl") || lower.contains("cdn-cgi") || lower.contains("cloudflare")
+        ) {
+            return true
+        }
+        val host = runCatching { URI(targetUrl.trim()).host?.lowercase(Locale.ROOT).orEmpty() }.getOrDefault("")
+        val rootDomain = host.removePrefix("www.")
+        if (rootDomain.isNotBlank() && (lower == host || lower == rootDomain) && !hasCloudflareClearanceCookie(targetUrl)) {
+            return true
+        }
+        return false
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -188,14 +199,12 @@ object LiveMangaSiteScraper {
             blockNetworkImage = !loadImages
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             cacheMode = WebSettings.LOAD_DEFAULT
-            val rawUa = userAgentString
-            val cleanUa = if (!rawUa.isNullOrBlank()) {
-                sanitizeWebViewUserAgent(rawUa)
-            } else {
-                activeUserAgent
+            // Keep the WebView's genuine default User-Agent untouched so window.navigator.userAgent,
+            // WorkerNavigator.userAgent (inside Turnstile Web Workers), and Sec-CH-UA match 100%.
+            val nativeUa = userAgentString
+            if (!nativeUa.isNullOrBlank()) {
+                activeUserAgent = nativeUa
             }
-            userAgentString = cleanUa
-            activeUserAgent = cleanUa
         }
     }
 
@@ -746,41 +755,61 @@ object LiveMangaSiteScraper {
                 }
             }
 
-            // If homepage or paginated page had few works, also try /manga/?m_orderby=latest or /series
-            if (works.size < 3 && searchQuery.isBlank() && !isGenreFilter && !hitCloudflare) {
+            // Merge catalog endpoints (/manga/, /series, /manga/?m_orderby=latest) when entering the source
+            // so all manga and manhwa are displayed even if the root homepage only shows a few featured items.
+            if (works.size < 18 && searchQuery.isBlank() && !isGenreFilter && !hitCloudflare) {
                 val base = site.url.trimEnd('/')
                 val altPaths = if (page > 1) {
                     listOf(
+                        "$base/manga/page/$page/",
                         "$base/manga/page/$page/?m_orderby=latest",
                         "$base/series?page=$page",
+                        "$base/manga/?page=$page",
                         "$base/manga/?page=$page&order=update",
                         "$base/page/$page/"
                     )
                 } else {
                     listOf(
-                        "$base/manga/?m_orderby=latest",
-                        "$base/series",
                         "$base/manga/",
+                        "$base/series",
+                        "$base/manga/?m_orderby=latest",
                         "$base/manga/?order=update"
                     )
                 }
+                val mergedWorks = LinkedHashMap<String, MangaWork>()
+                for (w in works) {
+                    val key = normalizeChapterUrlKey(w.mangaUrl).ifBlank { w.mangaUrl }
+                    mergedWorks[key] = w
+                }
                 for (altUrl in altPaths) {
+                    if (normalizeChapterUrlKey(altUrl) == normalizeChapterUrlKey(targetUrl)) continue
                     try {
                         httpClient.newCall(buildRequest(altUrl, referer = site.url)).execute().use { altResp ->
                             val altHtml = altResp.body?.string() ?: ""
-                            val altWorks = parseCatalogHtml(altHtml, site, altUrl)
-                            if (altWorks.size > works.size) {
-                                works = altWorks
+                            if (altResp.isSuccessful && altHtml.isNotBlank() && !isCloudflareChallengeHtml(altHtml, altResp.code)) {
+                                val altWorks = parseCatalogHtml(altHtml, site, altUrl)
+                                for (aw in altWorks) {
+                                    val key = normalizeChapterUrlKey(aw.mangaUrl).ifBlank { aw.mangaUrl }
+                                    val existing = mergedWorks[key]
+                                    if (existing == null) {
+                                        mergedWorks[key] = aw
+                                    } else if (existing.coverImageUrl.isNullOrBlank() && !aw.coverImageUrl.isNullOrBlank()) {
+                                        mergedWorks[key] = existing.copy(coverImageUrl = aw.coverImageUrl)
+                                    }
+                                }
                             }
                         }
                     } catch (_: Exception) {
                     }
-                    if (works.size >= 6) break
+                    if (mergedWorks.size >= 40) break
+                }
+                if (mergedWorks.size > works.size) {
+                    works = mergedWorks.values.toList()
                 }
             }
 
-            // Headless WebView fallback if OkHttp got 0 works (only run on Cloudflare if cf_clearance already exists so 0x0 WebView never poisons fresh Turnstile challenges)
-            if (works.isEmpty() && page == 1 && (!hitCloudflare || hasCloudflareClearanceCookie(targetUrl))) {
+            // Headless WebView fallback if OkHttp got 0 works (only run on Cloudflare if cf_clearance already exists)
+            if (works.isEmpty() && (!hitCloudflare || hasCloudflareClearanceCookie(targetUrl))) {
                 val domJson = evaluateJsInHeadlessWebView(targetUrl, JS_EXTRACT_CATALOG)
                 if (!domJson.isNullOrBlank()) {
                     val domRes = parseCatalogFromDomJson(domJson, site)
@@ -847,6 +876,19 @@ object LiveMangaSiteScraper {
         }
     }
 
+    private fun isGenericOrChapterAnchorText(text: String): Boolean {
+        val t = text.trim()
+        if (t.length < 2) return true
+        val lower = t.lowercase(Locale.ROOT)
+        if (lower in setOf("مانجا", "مانهوا", "مانها", "مكتمل", "مستمر", "مستمرة", "مكتملة", "جديد", "المزيد", "عرض المزيد", "read more", "more", "manga", "manhwa", "raw", "new", "hot", "top")) {
+            return true
+        }
+        if (Regex("""^(?:الفصل|فصل|chapter|ch\.?|ep\.?)\s*\d+""", RegexOption.IGNORE_CASE).containsMatchIn(lower)) {
+            return true
+        }
+        return false
+    }
+
     fun parseCatalogHtml(html: String, site: SiteEntity, pageUrl: String = site.url): List<MangaWork> {
         if (html.isBlank()) return emptyList()
         val results = LinkedHashMap<String, MangaWork>()
@@ -856,49 +898,107 @@ object LiveMangaSiteScraper {
             .replace(Regex("<script[^>]*>[\\s\\S]*?</script>", RegexOption.IGNORE_CASE), "")
             .replace(Regex("<style[^>]*>[\\s\\S]*?</style>", RegexOption.IGNORE_CASE), "")
 
-        // Strategy 1: Scan structured card blocks (Team-X .bs/.bsx/.box, Madara .page-item-detail/.c-tabs-item__content, MangaStream .utao/.bs, Mangatek cards)
-        val blockRegex = Regex(
-            """<(?:div|article|li)[^>]+class=["'][^"']*(?:page-item-detail|c-tabs-item__content|bsx|bs|manga__item|post-item|series-card|animepost|item-summary|utao|box|manga-card|serie-card|novel-item|grid-item|card)[^"']*["'][^>]*>([\s\S]{40,4500}?)</(?:div|article|li)>""",
+        // Pre-scan all work links that carry a title attribute or text (e.g. sibling <h3><a href="...">Title</a></h3>)
+        // so that thumbnail links (<a href="..."><img src="cover"></a>) without alt/title attributes still resolve their exact title!
+        val titleByNormUrl = LinkedHashMap<String, String>()
+        val firstAnchorPosByNormUrl = LinkedHashMap<String, IntRange>()
+        val resolvedUrlByNormUrl = LinkedHashMap<String, String>()
+        val allAnchorsRegex = Regex(
+            """<a\b([^>]*?)href=["']([^"']+)["']([^>]*)>([\s\S]{0,1500}?)</a>""",
             RegexOption.IGNORE_CASE
         )
-        blockRegex.findAll(bodyHtml).forEach { match ->
-            val block = match.groupValues[1]
-            val work = extractWorkFromCardFragment(block, site, pageUrl)
-            if (work != null && work.mangaUrl.isNotBlank() && !results.containsKey(work.mangaUrl)) {
-                results[work.mangaUrl] = work
+        allAnchorsRegex.findAll(bodyHtml).forEach { match ->
+            val rawHref = match.groupValues[2]
+            val resolvedHref = resolveUrl(pageUrl, rawHref)
+            if (!isLikelyMangaWorkUrl(resolvedHref, site.url)) return@forEach
+            val normKey = normalizeChapterUrlKey(resolvedHref).ifBlank { resolvedHref }
+            resolvedUrlByNormUrl.putIfAbsent(normKey, resolvedHref)
+            firstAnchorPosByNormUrl.putIfAbsent(normKey, match.range)
+
+            val fullOpenTag = "<a ${match.groupValues[1]} ${match.groupValues[3]}>"
+            val inner = match.groupValues[4]
+            val candidateTitle = listOf(
+                extractAttribute(fullOpenTag, "title"),
+                extractAttribute(inner, "alt"),
+                extractAttribute(inner, "title"),
+                stripHtmlTags(inner)
+            )
+                .map { cleanMangaTitle(it) }
+                .firstOrNull { !isGenericOrChapterAnchorText(it) }
+
+            if (!candidateTitle.isNullOrBlank()) {
+                val existing = titleByNormUrl[normKey]
+                if (existing == null || (existing.length < 4 && candidateTitle.length >= 4)) {
+                    titleByNormUrl[normKey] = candidateTitle
+                }
             }
         }
 
-        // Strategy 2: Scan all anchor tags wrapping an <img> that point to manga/series/work paths
-        val anchorWithImgRegex = Regex(
-            """<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]{10,2200}?)</a>""",
+        // Strategy 1: Scan structured card blocks (Team-X .bs/.bsx/.box, Madara .page-item-detail/.c-tabs-item__content, MangaStream .utao/.bs, Mangatek cards)
+        val blockRegex = Regex(
+            """<(?:div|article|li)[^>]+class=["'][^"']*(?:page-item-detail|c-tabs-item__content|bsx|bs|manga__item|post-item|series-card|animepost|item-summary|utao|box|manga-card|serie-card|novel-item|grid-item|card|list-item|manga-item|book-item|entry-item|thumb-item|slide-item|custom-card)[^"']*["'][^>]*>([\s\S]{40,4500}?)</(?:div|article|li)>""",
             RegexOption.IGNORE_CASE
         )
-        anchorWithImgRegex.findAll(bodyHtml).forEach { match ->
-            val rawHref = match.groupValues[1]
-            val inner = match.groupValues[2]
-            if (!inner.contains("<img", ignoreCase = true) && !inner.contains("background-image", ignoreCase = true)) {
+        val blockMatches = blockRegex.findAll(bodyHtml).toList()
+        for (i in blockMatches.indices) {
+            val match = blockMatches[i]
+            val nextStart = blockMatches.getOrNull(i + 1)?.range?.first ?: bodyHtml.length
+            val windowEnd = (match.range.last + 450).coerceAtMost(nextStart).coerceAtMost(bodyHtml.length)
+            val block = bodyHtml.substring(match.range.first, windowEnd)
+            val work = extractWorkFromCardFragment(block, site, pageUrl, titleByNormUrl)
+            if (work != null && work.mangaUrl.isNotBlank()) {
+                val normKey = normalizeChapterUrlKey(work.mangaUrl).ifBlank { work.mangaUrl }
+                if (!results.containsKey(normKey)) {
+                    results[normKey] = work
+                }
+            }
+        }
+
+        // Strategy 2: Scan all anchor tags wrapping an <img> or background-image that point to manga/series/work paths
+        allAnchorsRegex.findAll(bodyHtml).forEach { match ->
+            val rawHref = match.groupValues[2]
+            val inner = match.groupValues[4]
+            val fullAnchor = match.value
+            if (!inner.contains("<img", ignoreCase = true) &&
+                !inner.contains("background-image", ignoreCase = true) &&
+                !fullAnchor.contains("background-image", ignoreCase = true) &&
+                !fullAnchor.contains("data-bg", ignoreCase = true) &&
+                !fullAnchor.contains("data-src", ignoreCase = true)
+            ) {
                 return@forEach
             }
             val resolvedHref = resolveUrl(pageUrl, rawHref)
             if (!isLikelyMangaWorkUrl(resolvedHref, site.url)) return@forEach
+            val normKey = normalizeChapterUrlKey(resolvedHref).ifBlank { resolvedHref }
 
-            val imgUrl = extractBestImageUrl(inner, pageUrl)
+            val surroundingStart = (match.range.first - 350).coerceAtLeast(0)
+            val surroundingEnd = (match.range.last + 950).coerceAtMost(bodyHtml.length)
+            val cardWindow = bodyHtml.substring(surroundingStart, surroundingEnd)
+
+            val imgUrl = extractBestImageUrl(fullAnchor, pageUrl)
+                .ifBlank { extractBestImageUrl(cardWindow, pageUrl) }
             if (imgUrl.isBlank() || isIgnoredAssetImage(imgUrl)) return@forEach
 
-            val rawTitle = extractAttribute(match.value, "title")
-                .ifBlank { extractAttribute(inner, "alt") }
-                .ifBlank { stripHtmlTags(inner) }
-                .let { cleanMangaTitle(it) }
+            val headingRegex = Regex("""<(?:h2|h3|h4|h5|div|span)[^>]*class=["'][^"']*(?:post-title|tt|title|series-title|name)[^"']*["'][^>]*>([\s\S]*?)</(?:h2|h3|h4|h5|div|span)>""", RegexOption.IGNORE_CASE)
+            val windowHeading = headingRegex.find(cardWindow)?.groupValues?.getOrNull(1)?.let { cleanMangaTitle(stripHtmlTags(it)) }.orEmpty()
 
-            if (rawTitle.length >= 2 && !results.containsKey(resolvedHref)) {
+            val rawTitle = listOf(
+                extractAttribute(fullAnchor, "title"),
+                extractAttribute(inner, "alt"),
+                stripHtmlTags(inner),
+                titleByNormUrl[normKey].orEmpty(),
+                windowHeading,
+                slugFromUrl(resolvedHref).replace("-", " ")
+            )
+                .map { cleanMangaTitle(it) }
+                .firstOrNull { !isGenericOrChapterAnchorText(it) }
+                .orEmpty()
+
+            if (rawTitle.length >= 2 && !results.containsKey(normKey)) {
                 val id = slugFromUrl(resolvedHref)
-                val surroundingStart = (match.range.first - 300).coerceAtLeast(0)
-                val surroundingEnd = (match.range.last + 900).coerceAtMost(bodyHtml.length)
-                val cardWindow = bodyHtml.substring(surroundingStart, surroundingEnd)
                 val cardGenres = extractGenresFromCardFragment(cardWindow)
                     .ifEmpty { inferFallbackGenres(rawTitle, id) }
-                results[resolvedHref] = MangaWork(
+                results[normKey] = MangaWork(
                     id = id,
                     title = rawTitle,
                     mangaUrl = resolvedHref,
@@ -908,15 +1008,43 @@ object LiveMangaSiteScraper {
                     coverImageUrl = imgUrl,
                     genres = cardGenres
                 )
-            } else if (results.containsKey(resolvedHref)) {
-                val existing = results[resolvedHref]!!
+            } else if (results.containsKey(normKey)) {
+                val existing = results[normKey]!!
                 if (existing.coverImageUrl.isNullOrBlank() && imgUrl.isNotBlank()) {
-                    results[resolvedHref] = existing.copy(coverImageUrl = imgUrl)
+                    results[normKey] = existing.copy(coverImageUrl = imgUrl)
                 }
             }
         }
 
-        return results.values.toList()
+        // Strategy 3: For any work URL discovered in titleByNormUrl that wasn't matched above (e.g. cover <img> is a sibling div outside the <a>),
+        // inspect the surrounding card window around the link to pair it with its cover image.
+        for ((normKey, workTitle) in titleByNormUrl) {
+            if (results.containsKey(normKey)) continue
+            val anchorRange = firstAnchorPosByNormUrl[normKey] ?: continue
+            val resolvedHref = resolvedUrlByNormUrl[normKey] ?: continue
+            val winStart = (anchorRange.first - 450).coerceAtLeast(0)
+            val winEnd = (anchorRange.last + 450).coerceAtMost(bodyHtml.length)
+            val cardWindow = bodyHtml.substring(winStart, winEnd)
+            val imgUrl = extractBestImageUrl(cardWindow, pageUrl)
+            if (imgUrl.isBlank() || isIgnoredAssetImage(imgUrl)) continue
+            val id = slugFromUrl(resolvedHref)
+            val cardGenres = extractGenresFromCardFragment(cardWindow)
+                .ifEmpty { inferFallbackGenres(workTitle, id) }
+            results[normKey] = MangaWork(
+                id = id,
+                title = workTitle,
+                mangaUrl = resolvedHref,
+                siteName = site.name,
+                siteUrl = site.url,
+                siteIconKey = site.iconKey,
+                coverImageUrl = imgUrl,
+                genres = cardGenres
+            )
+        }
+
+        return results.entries
+            .sortedBy { firstAnchorPosByNormUrl[it.key]?.first ?: Int.MAX_VALUE }
+            .map { it.value }
     }
 
     private fun extractGenresFromCardFragment(fragment: String): List<String> {
@@ -956,7 +1084,12 @@ object LiveMangaSiteScraper {
         return genres.take(4)
     }
 
-    private fun extractWorkFromCardFragment(fragment: String, site: SiteEntity, baseUrl: String): MangaWork? {
+    private fun extractWorkFromCardFragment(
+        fragment: String,
+        site: SiteEntity,
+        baseUrl: String,
+        titleByNormUrl: Map<String, String> = emptyMap()
+    ): MangaWork? {
         val hrefRegex = Regex("""<a[^>]+href=["']([^"']+)["'][^>]*>""", RegexOption.IGNORE_CASE)
         val hrefs = hrefRegex.findAll(fragment)
             .map { resolveUrl(baseUrl, it.groupValues[1]) }
@@ -964,6 +1097,7 @@ object LiveMangaSiteScraper {
             .toList()
 
         val mangaUrl = hrefs.firstOrNull() ?: return null
+        val normKey = normalizeChapterUrlKey(mangaUrl).ifBlank { mangaUrl }
         val imgUrl = extractBestImageUrl(fragment, baseUrl)
         if (imgUrl.isBlank() || isIgnoredAssetImage(imgUrl)) return null
 
@@ -973,9 +1107,9 @@ object LiveMangaSiteScraper {
         val titleAttr = extractAttribute(fragment, "title")
         val altAttr = extractAttribute(fragment, "alt")
 
-        val title = listOf(headingTitle, titleAttr, altAttr)
+        val title = listOf(headingTitle, titleByNormUrl[normKey].orEmpty(), titleAttr, altAttr)
             .map { cleanMangaTitle(it) }
-            .firstOrNull { it.length >= 2 && !it.equals("مانجا", ignoreCase = true) }
+            .firstOrNull { !isGenericOrChapterAnchorText(it) }
             ?: cleanMangaTitle(slugFromUrl(mangaUrl).replace("-", " "))
 
         if (title.isBlank()) return null
@@ -3303,11 +3437,24 @@ object LiveMangaSiteScraper {
                             bodyTxt.indexOf("Enable JavaScript and cookies to continue") !== -1;
             var items = [];
             var seen = {};
+            var titleByHref = {};
+            var allPageLinks = document.querySelectorAll("a[href]");
+            for (var p = 0; p < allPageLinks.length; p++) {
+                var pl = allPageLinks[p];
+                var ph = pl.href || "";
+                if (!ph || ph.indexOf("javascript:") === 0) continue;
+                var pt = (pl.getAttribute("title") || pl.innerText || "").trim().split("\n")[0].trim();
+                if (pt && pt.length >= 2 && !/^(?:الفصل|فصل|chapter|ch\.?)\s*\d+/i.test(pt)) {
+                    if (!titleByHref[ph] || (titleByHref[ph].length < 4 && pt.length >= 4)) {
+                        titleByHref[ph] = pt;
+                    }
+                }
+            }
             var selectors = [
                 ".page-item-detail", ".c-tabs-item__content", ".bs .bsx", ".bs", ".listupd .utao",
                 ".box", ".manga__item", ".series-card", ".animepost", "article", ".item", ".post-item",
                 ".manga-card", ".serie-card", ".grid-item", ".card", ".gallery", ".manga-item",
-                ".book-item", ".entry-item", ".thumb-item", ".group"
+                ".book-item", ".entry-item", ".thumb-item"
             ];
             var cards = document.querySelectorAll(selectors.join(","));
             function getImgUrl(el) {
@@ -3325,7 +3472,11 @@ object LiveMangaSiteScraper {
                     }
                     if (src && src.indexOf("data:image") === -1) return src;
                 }
-                var bgEl = el.querySelector ? (el.querySelector("[style*='background-image']") || el) : el;
+                var bgEl = el.querySelector ? (el.querySelector("[style*='background-image'], [data-bg], [data-background]") || el) : el;
+                if (bgEl && bgEl.getAttribute) {
+                    var dataBg = bgEl.getAttribute("data-bg") || bgEl.getAttribute("data-background") || "";
+                    if (dataBg && dataBg.indexOf("data:image") === -1) return dataBg;
+                }
                 try {
                     var style = window.getComputedStyle(bgEl).backgroundImage;
                     if (style && style !== "none" && style.indexOf("url(") !== -1) {
@@ -3336,14 +3487,25 @@ object LiveMangaSiteScraper {
             }
             for (var i = 0; i < cards.length; i++) {
                 var c = cards[i];
-                var a = c.querySelector("a[href]");
+                var cardLinks = c.querySelectorAll("a[href]");
+                var a = null;
+                for (var cl = 0; cl < cardLinks.length; cl++) {
+                    var cand = cardLinks[cl];
+                    var chref = cand.href || "";
+                    if (!chref || chref.indexOf("javascript:") === 0 || chref.indexOf("#") !== -1) continue;
+                    if (/\/(?:genre|genres|manga-genre|tag|tags|category|author|artist)\//i.test(chref)) continue;
+                    if (/\/(?:chapter|ch|فصل|الفصل)[-_/\d]/i.test(decodeURIComponent(chref))) continue;
+                    a = cand;
+                    break;
+                }
+                if (!a) a = c.querySelector("a[href]");
                 if (!a || !a.href) continue;
                 var href = a.href;
                 if (seen[href]) continue;
                 var imgUrl = getImgUrl(c);
                 if (!imgUrl) continue;
                 var heading = c.querySelector("h2, h3, h4, h5, .post-title, .tt, .title, .name, .caption, .series-title");
-                var t = (heading ? heading.innerText : (a.getAttribute("title") || a.innerText || "")).trim();
+                var t = (heading ? heading.innerText : (titleByHref[href] || a.getAttribute("title") || a.innerText || "")).trim();
                 if (!t) {
                     var im = c.querySelector("img[alt]");
                     if (im) t = (im.getAttribute("alt") || "").trim();
@@ -3361,37 +3523,34 @@ object LiveMangaSiteScraper {
                     items.push({ title: t.split("\n")[0].trim(), url: href, cover: imgUrl, genres: genres.slice(0, 4) });
                 }
             }
-            // Universal fallback for Tailwind / custom sites (e.g. hentairead.com) where cards don't use standard WP class names
-            if (items.length < 4) {
-                var allLinks = document.querySelectorAll("a[href]");
-                for (var k = 0; k < allLinks.length; k++) {
-                    var link = allLinks[k];
-                    var lHref = link.href || "";
-                    if (!lHref || seen[lHref] || lHref.indexOf("javascript:") === 0) continue;
-                    if (link.closest && link.closest("nav, header, footer, .pagination, .page-numbers")) continue;
-                    var container = (link.closest && link.closest("article, li, .group, .relative, div")) || link.parentElement || link;
-                    var lImg = getImgUrl(link) || getImgUrl(container);
-                    if (!lImg) continue;
-                    var lowerImg = lImg.toLowerCase();
-                    if (lowerImg.indexOf("logo") !== -1 || lowerImg.indexOf("avatar") !== -1 || lowerImg.indexOf("favicon") !== -1 || lowerImg.indexOf(".svg") !== -1) continue;
-                    var lTitle = (link.getAttribute("title") || "").trim();
-                    if (!lTitle) {
-                        var hEl = (link.querySelector && link.querySelector("h2, h3, h4, h5, .title, .name, span")) ||
-                                  (container && container.querySelector && container.querySelector("h2, h3, h4, h5, .title, .name, a[title]"));
-                        if (hEl) lTitle = (hEl.getAttribute("title") || hEl.innerText || "").trim();
-                    }
-                    if (!lTitle) {
-                        var imgEl = (link.querySelector && link.querySelector("img[alt]")) || (container && container.querySelector && container.querySelector("img[alt]"));
-                        if (imgEl) lTitle = (imgEl.getAttribute("alt") || "").trim();
-                    }
-                    if (!lTitle) {
-                        lTitle = (link.innerText || (container ? container.innerText : "") || "").trim();
-                    }
-                    lTitle = lTitle.split("\n")[0].trim();
-                    if (lTitle && lTitle.length >= 2) {
-                        seen[lHref] = true;
-                        items.push({ title: lTitle, url: lHref, cover: lImg, genres: [] });
-                    }
+            // Always scan all links with images on the page so works in sliders, grids, or custom layouts are never missed
+            for (var k = 0; k < allPageLinks.length; k++) {
+                var link = allPageLinks[k];
+                var lHref = link.href || "";
+                if (!lHref || seen[lHref] || lHref.indexOf("javascript:") === 0) continue;
+                if (link.closest && link.closest("nav, header, footer, .pagination, .page-numbers")) continue;
+                var container = (link.closest && link.closest("article, li, .page-item-detail, .bs, .bsx, .utao, .box, .group, .relative, div")) || link.parentElement || link;
+                var lImg = getImgUrl(link) || getImgUrl(container);
+                if (!lImg) continue;
+                var lowerImg = lImg.toLowerCase();
+                if (lowerImg.indexOf("logo") !== -1 || lowerImg.indexOf("avatar") !== -1 || lowerImg.indexOf("favicon") !== -1 || lowerImg.indexOf(".svg") !== -1) continue;
+                var lTitle = (titleByHref[lHref] || link.getAttribute("title") || "").trim();
+                if (!lTitle) {
+                    var hEl = (link.querySelector && link.querySelector("h2, h3, h4, h5, .title, .name, span")) ||
+                              (container && container.querySelector && container.querySelector("h2, h3, h4, h5, .post-title, .tt, .title, .name, a[title]"));
+                    if (hEl) lTitle = (hEl.getAttribute("title") || hEl.innerText || "").trim();
+                }
+                if (!lTitle) {
+                    var imgEl = (link.querySelector && link.querySelector("img[alt]")) || (container && container.querySelector && container.querySelector("img[alt]"));
+                    if (imgEl) lTitle = (imgEl.getAttribute("alt") || "").trim();
+                }
+                if (!lTitle) {
+                    lTitle = (link.innerText || (container ? container.innerText : "") || "").trim();
+                }
+                lTitle = lTitle.split("\n")[0].trim();
+                if (lTitle && lTitle.length >= 2) {
+                    seen[lHref] = true;
+                    items.push({ title: lTitle, url: lHref, cover: lImg, genres: [] });
                 }
             }
             var isCf = hasCfTitle || hasCfStage || (hasCfBody && items.length === 0);
@@ -3400,7 +3559,7 @@ object LiveMangaSiteScraper {
                 cf: isCf,
                 pageUrl: window.location.href || "",
                 count: items.length,
-                items: items.slice(0, 100),
+                items: items.slice(0, 300),
                 html: rawHtml
             });
         })();
@@ -3784,8 +3943,8 @@ object LiveMangaSiteScraper {
                 }
             }
             val rawHtml = obj.optString("html")
-            if (rawHtml.isNotBlank() && list.size < 12) {
-                val htmlWorks = parseCatalogHtml(rawHtml, site)
+            if (rawHtml.isNotBlank()) {
+                val htmlWorks = parseCatalogHtml(rawHtml, site, effectiveBaseUrl)
                 for (hw in htmlWorks) {
                     val normKey = normalizeChapterUrlKey(hw.mangaUrl)
                     if (normKey.isNotBlank() && normKey !in seenUrls) {
@@ -4233,33 +4392,35 @@ object LiveMangaSiteScraper {
         val normUrl = normalizeChapterUrlKey(lower)
         val normBase = normalizeChapterUrlKey(decodeUrlSafe(siteUrl))
         if (normUrl.isBlank() || normUrl == normBase) return false
-        val rejectedSegments = listOf(
-            "/wp-login", "/wp-admin", "/login", "/register", "/contact", "/privacy",
-            "/terms", "/dmca", "/discord", "/facebook", "/twitter", "/tag/", "/tags/",
-            "/manga-genre/", "/genre/", "/genres/", "/category/", "/categories/",
-            "/collection/", "/collections/", "/page/", "?s=", "?page=", "/author/",
-            "/authors/", "/artist/", "/artists/", "/parody/", "/parodies/", "/character/",
-            "/characters/", "/group/", "/groups/", "/language/", "/languages/",
-            "/bookmark", "/history", "/popular", "/latest", "/trending", "/random",
-            "/search", "/about", "/faq", "/list", "/az-list", "/alphabet"
+        val alwaysRejectedSubstrings = listOf(
+            "/wp-login", "/wp-admin", "/wp-content/", "/wp-includes/", "/wp-json/",
+            "/tag/", "/tags/", "/manga-genre/", "/genre/", "/genres/",
+            "/category/", "/categories/", "/collection/", "/collections/",
+            "/page/", "?s=", "?page=", "/author/", "/authors/", "/artist/",
+            "/artists/", "/parody/", "/parodies/", "/character/", "/characters/",
+            "/group/", "/groups/", "/language/", "/languages/", "/cdn-cgi/"
         )
-        if (rejectedSegments.any { lower.contains(it) }) return false
+        if (alwaysRejectedSubstrings.any { lower.contains(it) }) return false
         if (Regex("""/(?:chapter|ch|فصل|الفصل)[-_/\d]""").containsMatchIn(lower)) return false
-        if (lower.contains("/manga/") ||
-            lower.contains("/series/") ||
-            lower.contains("/work/") ||
-            lower.contains("/comic/") ||
-            lower.contains("/manhwa/") ||
-            lower.contains("/manhua/") ||
-            lower.contains("/webtoon/") ||
-            lower.contains("/hentai/") ||
-            lower.contains("/doujinshi/") ||
-            lower.contains("/doujin/") ||
-            lower.contains("/gallery/") ||
-            lower.contains("/g/")
-        ) {
-            return true
+
+        val explicitWorkPrefixes = listOf(
+            "/manga/", "/series/", "/work/", "/comic/", "/comics/",
+            "/manhwa/", "/manhua/", "/webtoon/", "/novel/",
+            "/hentai/", "/doujinshi/", "/doujin/", "/gallery/", "/g/"
+        )
+        for (prefix in explicitWorkPrefixes) {
+            val idx = lower.indexOf(prefix)
+            if (idx != -1) {
+                val after = lower.substring(idx + prefix.length).substringBefore("?").substringBefore("#").trim('/')
+                if (after.isNotBlank()) return true
+            }
         }
+
+        // Reject standalone non-work navigation paths (only when complete segment, not part of a slug)
+        if (Regex("""/(?:login|register|contact|privacy|terms|dmca|discord|facebook|twitter|bookmark|bookmarks|history|popular|latest|trending|random|search|about|faq|list|az-list|alphabet)(?:/|$|\?|#)""").containsMatchIn(lower)) {
+            return false
+        }
+
         val urlHost = runCatching { URI(url).host?.lowercase(Locale.ROOT)?.removePrefix("www.").orEmpty() }.getOrDefault("")
         val siteHost = runCatching { URI(siteUrl).host?.lowercase(Locale.ROOT)?.removePrefix("www.").orEmpty() }.getOrDefault("")
         val urlPath = runCatching { URI(url).path?.trim('/').orEmpty() }.getOrDefault("")
